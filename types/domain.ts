@@ -2,13 +2,6 @@ export type UserRole = "admin" | "rider";
 
 export type RiderStatus = "active" | "inactive";
 
-export type OrderStatus =
-  | "today"
-  | "assigned"
-  | "delivered"
-  | "pending_payment"
-  | "cancelled";
-
 export type PaymentMethod =
   | "cash"
   | "bank_transfer"
@@ -17,25 +10,41 @@ export type PaymentMethod =
   | "credit"
   | "unknown";
 
-export type OrderPaymentStatus =
-  | "paid"
-  | "partial"
-  | "due"
-  | "verification_pending"
-  | "unpaid";
-
 export type PaymentRecordStatus =
   | "verified"
   | "pending_verification"
   | "rejected"
   | "received";
 
-export type LedgerEntryType = "order" | "payment" | "adjustment";
+export type LedgerEntryType = "delivery" | "payment" | "adjustment";
+
+export type OrderStatus = "assigned" | "today" | "delivered" | "pending_payment" | "cancelled";
+
+export type OrderPaymentStatus =
+  | "unpaid"
+  | "paid"
+  | "partial"
+  | "due"
+  | "verification_pending";
+
+export type DeliveryFrequency = "daily" | "weekdays" | "custom_days";
+
+export type BillingCycle = "monthly";
+
+export type SubscriptionStatus = "active" | "inactive" | "paused" | "ended";
+
+export type DeliveryRecordStatus =
+  | "scheduled"
+  | "delivered"
+  | "partially_delivered"
+  | "not_delivered"
+  | "skipped"
+  | "rescheduled";
 
 export type DeliveryPaymentOutcome =
   | "cash_received"
   | "online_claimed"
-  | "unpaid_due"
+  | "credit_due"
   | "partial_payment";
 
 export interface SessionUser {
@@ -63,13 +72,6 @@ export interface Customer {
   address: string;
   area: string;
   notes?: string;
-  dailyBottleQty: number;
-  pricePerBottle: number;
-  paymentMethod: PaymentMethod;
-  assignedRiderId?: string;
-  billingMonth: string;
-  serviceStartDate: string;
-  serviceEndDate: string;
   createdAt: string;
   isActive: boolean;
 }
@@ -84,14 +86,54 @@ export interface Rider {
   createdAt: string;
 }
 
+export interface Subscription {
+  id: string;
+  customerId: string;
+  riderId?: string;
+  bottlesPerDelivery: number;
+  deliveryFrequency: DeliveryFrequency;
+  deliveryDays: number[];
+  preferredTimeSlot?: string;
+  monthlyAmount: number;
+  paymentMethod: PaymentMethod;
+  billingCycle: BillingCycle;
+  startDate: string;
+  endDate?: string;
+  status: SubscriptionStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DeliveryRecord {
+  id: string;
+  customerId: string;
+  subscriptionId: string;
+  riderId?: string;
+  scheduledDate: string;
+  scheduledTimeSlot?: string;
+  scheduledBottles: number;
+  deliveredBottles?: number;
+  status: DeliveryRecordStatus;
+  expectedAmount: number;
+  collectedAmount: number;
+  dueAmount: number;
+  deliveredAt?: string;
+  transactionReference?: string;
+  note?: string;
+  proofUrl?: string;
+  createdAt: string;
+  updatedAt: string;
+  locationUrl?: string;
+}
+
 export interface Order {
   id: string;
   orderNumber: string;
   customerId: string;
+  subscriptionId?: string;
   riderId?: string;
   bottleQty: number;
   deliveredQty?: number;
-  pricePerBottle: number;
   totalAmount: number;
   amountReceived: number;
   dueAmount: number;
@@ -100,19 +142,19 @@ export interface Order {
   orderStatus: OrderStatus;
   expectedPaymentMethod: PaymentMethod;
   paymentStatus: OrderPaymentStatus;
-  createdBy: string;
   createdAt: string;
   updatedAt: string;
-  serviceDay?: string;
-  isSubscriptionOrder?: boolean;
   transactionReference?: string;
+  proofUrl?: string;
   locationUrl?: string;
 }
 
 export interface Payment {
   id: string;
-  orderId?: string;
   customerId: string;
+  subscriptionId?: string;
+  deliveryRecordId?: string;
+  orderId?: string;
   riderId?: string;
   amount: number;
   paymentMethod: PaymentMethod;
@@ -128,6 +170,8 @@ export interface Payment {
 export interface LedgerEntry {
   id: string;
   customerId: string;
+  subscriptionId?: string;
+  deliveryRecordId?: string;
   orderId?: string;
   paymentId?: string;
   entryType: LedgerEntryType;
@@ -150,12 +194,17 @@ export interface RiderCollectionSummary {
   cashCollected: number;
   onlineClaimed: number;
   pendingReconciliation: number;
-  deliveredCount: number;
+  completedDeliveries: number;
+  missedDeliveries: number;
+  deliveredCount?: number;
 }
 
 export interface ReportSummary {
-  totalOrders: number;
-  deliveredOrders: number;
+  totalScheduledDeliveries: number;
+  completedDeliveries: number;
+  missedDeliveries: number;
+  totalOrders?: number;
+  deliveredOrders?: number;
   cashCollected: number;
   pendingVerification: number;
   totalDue: number;

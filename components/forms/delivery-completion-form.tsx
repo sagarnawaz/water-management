@@ -13,7 +13,7 @@ import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { formatCurrency } from "@/lib/format";
-import type { Customer, Order } from "@/types/domain";
+import type { Customer, DeliveryRecord, Subscription } from "@/types/domain";
 import {
   deliverySchema,
   type DeliveryFormValues,
@@ -21,10 +21,12 @@ import {
 } from "@/validations/delivery";
 
 export function DeliveryCompletionForm({
-  order,
+  deliveryRecord,
+  subscription,
   customer,
 }: {
-  order: Order;
+  deliveryRecord: DeliveryRecord;
+  subscription?: Subscription;
   customer: Customer;
 }) {
   const router = useRouter();
@@ -39,29 +41,33 @@ export function DeliveryCompletionForm({
   } = useForm<DeliveryFormValues, undefined, DeliveryInput>({
     resolver: zodResolver(deliverySchema),
     defaultValues: {
-      orderId: order.id,
-      deliveredQty: order.bottleQty,
-      paymentOutcome: "cash_received",
-      amountReceived: order.totalAmount,
+      deliveryRecordId: deliveryRecord.id,
+      deliveredQty: deliveryRecord.scheduledBottles,
+      status: "delivered",
+      paymentOutcome:
+        subscription?.paymentMethod === "credit" ? "credit_due" : "cash_received",
+      amountReceived: deliveryRecord.expectedAmount,
       transactionReference: "",
       notes: "",
     },
   });
 
   const paymentOutcome = useWatch({ control, name: "paymentOutcome" });
+  const status = useWatch({ control, name: "status" });
   const amountReceived = Number(useWatch({ control, name: "amountReceived" }) || 0);
-  const remainingDue = Math.max(order.totalAmount - amountReceived, 0);
+  const remainingDue = Math.max(deliveryRecord.expectedAmount - amountReceived, 0);
 
   const onSubmit = handleSubmit((values) => {
     const formData = new FormData();
-    formData.set("orderId", values.orderId);
+    formData.set("deliveryRecordId", values.deliveryRecordId);
     formData.set("customerId", customer.id);
+    formData.set("subscriptionId", deliveryRecord.subscriptionId);
     formData.set("deliveredQty", String(values.deliveredQty));
+    formData.set("status", values.status);
     formData.set("paymentOutcome", values.paymentOutcome);
     formData.set("amountReceived", String(values.amountReceived ?? 0));
     formData.set("transactionReference", values.transactionReference ?? "");
     formData.set("notes", values.notes ?? "");
-    formData.set("totalAmount", String(order.totalAmount));
 
     if (proofFile) {
       formData.set("proof", proofFile);
@@ -74,7 +80,7 @@ export function DeliveryCompletionForm({
         setServerError(result.message ?? "Unable to record delivery.");
         return;
       }
-      router.push(result.redirectTo ?? `/rider/deliveries/${order.id}/success`);
+      router.push(result.redirectTo ?? `/rider/deliveries/${deliveryRecord.id}/success`);
       router.refresh();
     });
   });
@@ -83,25 +89,38 @@ export function DeliveryCompletionForm({
     <form className="space-y-5" onSubmit={onSubmit}>
       <Card>
         <CardContent className="grid gap-4 p-5 sm:grid-cols-2">
+          <div className="space-y-2 sm:col-span-2">
+            <Label htmlFor="status">Delivery status</Label>
+            <Select id="status" {...register("status")}>
+              <option value="delivered">Delivered</option>
+              <option value="partially_delivered">Partially delivered</option>
+              <option value="not_delivered">Not delivered</option>
+              <option value="skipped">Skipped</option>
+              <option value="rescheduled">Rescheduled</option>
+            </Select>
+          </div>
+
           <div className="space-y-2">
-            <Label htmlFor="deliveredQty">Delivered quantity</Label>
-            <Input id="deliveredQty" type="number" min="1" {...register("deliveredQty")} />
+            <Label htmlFor="deliveredQty">Delivered bottles</Label>
+            <Input id="deliveredQty" type="number" min="0" {...register("deliveredQty")} />
             {errors.deliveredQty ? (
               <p className="text-sm text-destructive">{errors.deliveredQty.message}</p>
             ) : null}
           </div>
+
           <div className="rounded-3xl bg-primary/8 p-4">
-            <p className="text-sm text-muted-foreground">Order amount</p>
+            <p className="text-sm text-muted-foreground">Expected amount</p>
             <p className="mt-2 text-3xl font-semibold text-foreground">
-              {formatCurrency(order.totalAmount)}
+              {formatCurrency(deliveryRecord.expectedAmount)}
             </p>
           </div>
+
           <div className="space-y-2 sm:col-span-2">
             <Label htmlFor="paymentOutcome">Payment outcome</Label>
             <Select id="paymentOutcome" {...register("paymentOutcome")}>
               <option value="cash_received">Cash received</option>
               <option value="online_claimed">Online payment claimed</option>
-              <option value="unpaid_due">Unpaid / due</option>
+              <option value="credit_due">Credit / due</option>
               <option value="partial_payment">Partial payment</option>
             </Select>
           </div>
@@ -127,18 +146,20 @@ export function DeliveryCompletionForm({
             </div>
           ) : null}
 
-          {paymentOutcome === "partial_payment" || paymentOutcome === "unpaid_due" ? (
+          {(paymentOutcome === "partial_payment" || paymentOutcome === "credit_due") ? (
             <div className="rounded-3xl bg-amber-500/10 p-4">
               <p className="text-sm text-amber-700">Remaining due</p>
               <p className="mt-2 text-3xl font-semibold text-foreground">
                 {formatCurrency(
-                  paymentOutcome === "unpaid_due" ? order.totalAmount : remainingDue,
+                  paymentOutcome === "credit_due" ? deliveryRecord.expectedAmount : remainingDue,
                 )}
               </p>
             </div>
           ) : null}
 
-          {(paymentOutcome === "online_claimed" || paymentOutcome === "partial_payment") ? (
+          {(paymentOutcome === "online_claimed" ||
+            paymentOutcome === "partial_payment" ||
+            status === "not_delivered") ? (
             <div className="space-y-2 sm:col-span-2">
               <Label htmlFor="proof">Screenshot or delivery proof</Label>
               <Input
@@ -154,7 +175,7 @@ export function DeliveryCompletionForm({
             <Label htmlFor="notes">Notes</Label>
             <Textarea
               id="notes"
-              placeholder="Signature, gate guard, or collection notes"
+              placeholder="Gate locked, partial stock, customer requested later time, or collection note"
               {...register("notes")}
             />
           </div>
@@ -165,7 +186,7 @@ export function DeliveryCompletionForm({
 
       <div className="sticky bottom-4 z-30 rounded-[1.75rem] border bg-white/95 p-3 shadow-lg backdrop-blur">
         <Button type="submit" size="lg" className="h-12 w-full rounded-2xl">
-          {isPending ? "Submitting..." : "Submit delivery"}
+          {isPending ? "Submitting..." : "Submit delivery update"}
         </Button>
       </div>
     </form>

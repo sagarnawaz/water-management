@@ -1,12 +1,18 @@
 import { PaymentForm } from "@/components/forms/payment-form";
 import { PageHeader } from "@/components/layout/page-header";
-import { listCustomers, listOrders, listRiders } from "@/services/data";
+import {
+  listCustomers,
+  listDeliveryRecords,
+  listRiders,
+  listSubscriptions,
+} from "@/services/data";
 
 export default async function ManualPaymentPage() {
-  const [customers, riders, orders] = await Promise.all([
+  const [customers, riders, subscriptions, deliveryRecords] = await Promise.all([
     listCustomers(),
     listRiders(),
-    listOrders(),
+    listSubscriptions(),
+    listDeliveryRecords(),
   ]);
 
   return (
@@ -16,7 +22,12 @@ export default async function ManualPaymentPage() {
         title="Manual payment entry"
         description="Record later collections taken by the owner or reconcile rider-submitted payments."
       />
-      <PaymentForm customers={customers} riders={riders} orders={orders} />
+      <PaymentForm
+        customers={customers}
+        riders={riders}
+        subscriptions={subscriptions}
+        deliveryRecords={deliveryRecords}
+      />
     </div>
   );
 }

@@ -13,7 +13,7 @@ import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { paymentMethodOptions } from "@/lib/constants";
-import type { Customer, Order, Rider } from "@/types/domain";
+import type { Customer, DeliveryRecord, Rider, Subscription } from "@/types/domain";
 import {
   manualPaymentSchema,
   type ManualPaymentFormValues,
@@ -23,11 +23,13 @@ import {
 export function PaymentForm({
   customers,
   riders,
-  orders,
+  subscriptions,
+  deliveryRecords,
 }: {
   customers: Customer[];
   riders: Rider[];
-  orders: Order[];
+  subscriptions: Subscription[];
+  deliveryRecords: DeliveryRecord[];
 }) {
   const router = useRouter();
   const [serverError, setServerError] = useState<string | null>(null);
@@ -40,8 +42,9 @@ export function PaymentForm({
     resolver: zodResolver(manualPaymentSchema),
     defaultValues: {
       customerId: "",
+      subscriptionId: "",
+      deliveryRecordId: "",
       riderId: "",
-      orderId: "",
       amount: 0,
       paymentMethod: "cash",
       transactionReference: "",
@@ -81,12 +84,23 @@ export function PaymentForm({
             ) : null}
           </div>
           <div className="space-y-2">
-            <Label htmlFor="orderId">Linked order</Label>
-            <Select id="orderId" {...register("orderId")}>
+            <Label htmlFor="subscriptionId">Linked subscription</Label>
+            <Select id="subscriptionId" {...register("subscriptionId")}>
               <option value="">Optional</option>
-              {orders.map((order) => (
-                <option key={order.id} value={order.id}>
-                  {order.orderNumber}
+              {subscriptions.map((subscription) => (
+                <option key={subscription.id} value={subscription.id}>
+                  {subscription.id.slice(0, 8)} - {subscription.paymentMethod}
+                </option>
+              ))}
+            </Select>
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="deliveryRecordId">Linked delivery</Label>
+            <Select id="deliveryRecordId" {...register("deliveryRecordId")}>
+              <option value="">Optional</option>
+              {deliveryRecords.map((deliveryRecord) => (
+                <option key={deliveryRecord.id} value={deliveryRecord.id}>
+                  {deliveryRecord.scheduledDate} - {deliveryRecord.scheduledBottles} bottles
                 </option>
               ))}
             </Select>

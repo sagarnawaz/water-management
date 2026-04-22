@@ -3,6 +3,7 @@ import {
   endOfMonth,
   format,
   isAfter,
+  isBefore,
   isFuture,
   isValid,
   min,
@@ -123,6 +124,53 @@ export function getServiceDateKeys(input: {
   }
 
   return eachDayOfInterval(horizon).map((date) => format(date, "yyyy-MM-dd"));
+}
+
+export function getScheduledDeliveryDateKeys(input: {
+  startDate?: string;
+  endDate?: string | null;
+  deliveryFrequency?: "daily" | "weekdays" | "custom_days";
+  deliveryDays?: number[];
+  windowStart?: Date;
+  windowEnd?: Date;
+}) {
+  if (!input.startDate) {
+    return [];
+  }
+
+  const startDate = parseISO(input.startDate);
+  const rawEndDate = input.endDate ? parseISO(input.endDate) : null;
+  const windowStart = input.windowStart ?? new Date();
+  const windowEnd = input.windowEnd ?? endOfMonth(windowStart);
+
+  if (!isValid(startDate) || !isValid(windowStart) || !isValid(windowEnd)) {
+    return [];
+  }
+
+  const effectiveStart = isBefore(startDate, windowStart) ? windowStart : startDate;
+  const effectiveEnd = rawEndDate && isBefore(rawEndDate, windowEnd) ? rawEndDate : windowEnd;
+
+  if (isAfter(effectiveStart, effectiveEnd)) {
+    return [];
+  }
+
+  const allowedWeekDays = new Set((input.deliveryDays ?? []).map((value) => Number(value)));
+  const frequency = input.deliveryFrequency ?? "daily";
+
+  return eachDayOfInterval({ start: effectiveStart, end: effectiveEnd })
+    .filter((date) => {
+      if (frequency === "daily") {
+        return true;
+      }
+
+      if (frequency === "weekdays") {
+        const day = date.getDay();
+        return day >= 1 && day <= 5;
+      }
+
+      return allowedWeekDays.size === 0 ? true : allowedWeekDays.has(date.getDay());
+    })
+    .map((date) => format(date, "yyyy-MM-dd"));
 }
 
 export function canActivateCustomerToday(serviceStartDate: string) {

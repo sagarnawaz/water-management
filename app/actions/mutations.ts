@@ -2,18 +2,18 @@
 
 import { Buffer } from "node:buffer";
 import { revalidatePath } from "next/cache";
-import { endOfMonth, format, parseISO, startOfMonth } from "date-fns";
 
-import { normalizeServiceMonth } from "@/lib/customer-service";
 import { requireUser } from "@/lib/auth/session";
 import { createServerSupabaseClient } from "@/lib/supabase/server";
-import { cancelPendingSubscriptionOrders, syncCustomerSubscriptionOrders } from "@/services/subscription-sync";
+import {
+  syncSubscriptionDeliveries,
+} from "@/services/subscription-sync";
 import type { DeliveryPaymentOutcome, PaymentMethod } from "@/types/domain";
 import { customerSchema, type CustomerInput } from "@/validations/customer";
 import { deliverySchema } from "@/validations/delivery";
-import { orderSchema, type OrderInput } from "@/validations/order";
 import { manualPaymentSchema, type ManualPaymentInput } from "@/validations/payment";
 import { riderSchema, type RiderInput } from "@/validations/rider";
+import { subscriptionSchema, type SubscriptionInput } from "@/validations/subscription";
 
 type MutationResult = {
   success: boolean;
@@ -27,6 +27,10 @@ function buildMutationResult(path: string, message: string): MutationResult {
     redirectTo: path,
     message,
   };
+}
+
+function roundAmount(value: number) {
+  return Number(value.toFixed(2));
 }
 
 async function uploadOptionalProof(file: File | null) {
@@ -51,7 +55,32 @@ async function uploadOptionalProof(file: File | null) {
   }
 
   const { data } = supabase.storage.from("delivery-proofs").getPublicUrl(path);
-  return data.publicUrl;
+
+  return {
+    path,
+    publicUrl: data.publicUrl,
+  };
+}
+
+function getChargeAmount(input: {
+  status: string;
+  scheduledBottles: number;
+  deliveredQty: number;
+  expectedAmount: number;
+}) {
+  if (
+    input.status === "not_delivered" ||
+    input.status === "skipped" ||
+    input.status === "rescheduled"
+  ) {
+    return 0;
+  }
+
+  if (!input.scheduledBottles || input.deliveredQty >= input.scheduledBottles) {
+    return input.expectedAmount;
+  }
+
+  return roundAmount((input.expectedAmount / input.scheduledBottles) * input.deliveredQty);
 }
 
 export async function saveCustomerAction(input: CustomerInput): Promise<MutationResult> {
@@ -69,65 +98,125 @@ export async function saveCustomerAction(input: CustomerInput): Promise<Mutation
   }
 
   const supabase = await createServerSupabaseClient();
-  const normalizedBillingMonth = normalizeServiceMonth(parsed.data.billingMonth);
-  const normalizedServiceStartDate = format(
-    parseISO(parsed.data.serviceStartDate),
-    "yyyy-MM-dd",
-  );
-  const serviceEndDate = format(
-    endOfMonth(startOfMonth(parseISO(normalizedBillingMonth))),
-    "yyyy-MM-dd",
-  );
-  const isActive = parsed.data.serviceStatus === "active";
   const payload = {
     name: parsed.data.name,
     phone: parsed.data.phone,
     alternate_phone: parsed.data.alternatePhone || null,
     address: parsed.data.address,
     area: parsed.data.area,
-    daily_bottle_qty: parsed.data.dailyBottleQty,
-    price_per_bottle: parsed.data.pricePerBottle,
-    default_payment_method: parsed.data.paymentMethod,
-    assigned_rider_id: parsed.data.assignedRiderId || null,
-    billing_month: normalizedBillingMonth,
-    service_start_date: normalizedServiceStartDate,
-    service_end_date: serviceEndDate,
-    activated_at: isActive ? new Date().toISOString() : null,
-    is_active: isActive,
     notes: parsed.data.notes || null,
+    is_active: parsed.data.isActive,
   };
 
-  let customerId = parsed.data.id;
   if (parsed.data.id) {
-    await supabase.from("customers").update(payload).eq("id", parsed.data.id);
+    const { error } = await supabase.from("customers").update(payload).eq("id", parsed.data.id);
+    if (error) {
+      throw error;
+    }
   } else {
-    const { data: createdCustomer } = await supabase
-      .from("customers")
-      .insert(payload)
-      .select("id")
-      .single();
-
-    customerId = createdCustomer?.id;
-  }
-
-  if (customerId) {
-    if (isActive) {
-      await syncCustomerSubscriptionOrders({
-        customerId,
-      });
-    } else {
-      await cancelPendingSubscriptionOrders(customerId);
+    const { error } = await supabase.from("customers").insert(payload);
+    if (error) {
+      throw error;
     }
   }
 
+  revalidatePath("/admin");
   revalidatePath("/admin/customers");
-  revalidatePath("/admin/orders");
-  revalidatePath("/rider");
-  revalidatePath("/rider/deliveries");
+  revalidatePath("/admin/subscriptions");
 
   return buildMutationResult(
     "/admin/customers",
     parsed.data.id ? "Customer updated." : "Customer created.",
+  );
+}
+
+export async function saveSubscriptionAction(
+  input: SubscriptionInput,
+): Promise<MutationResult> {
+  const user = await requireUser("admin");
+  const parsed = subscriptionSchema.safeParse(input);
+
+  if (!parsed.success) {
+    return {
+      success: false,
+      message:
+        parsed.error.flatten().fieldErrors.customerId?.[0] ??
+        parsed.error.flatten().fieldErrors.bottlesPerDelivery?.[0] ??
+        "Please check the subscription form.",
+    };
+  }
+
+  const supabase = await createServerSupabaseClient();
+  const payload = {
+    customer_id: parsed.data.customerId,
+    rider_id: parsed.data.riderId || null,
+    bottles_per_delivery: parsed.data.bottlesPerDelivery,
+    delivery_frequency: parsed.data.deliveryFrequency,
+    delivery_days: parsed.data.deliveryDays,
+    preferred_time_slot: parsed.data.preferredTimeSlot || null,
+    monthly_amount: parsed.data.monthlyAmount,
+    payment_method: parsed.data.paymentMethod,
+    billing_cycle: parsed.data.billingCycle,
+    start_date: parsed.data.startDate,
+    end_date: parsed.data.endDate || null,
+    status: parsed.data.status,
+    created_by: user.id,
+  };
+
+  let subscriptionId = parsed.data.id;
+
+  if (parsed.data.id) {
+    const { error } = await supabase
+      .from("subscriptions")
+      .update(payload)
+      .eq("id", parsed.data.id);
+    if (error) {
+      throw error;
+    }
+  } else {
+    const { data, error } = await supabase
+      .from("subscriptions")
+      .insert(payload)
+      .select("id")
+      .single();
+    if (error) {
+      throw error;
+    }
+    subscriptionId = data?.id;
+  }
+
+  if (subscriptionId && parsed.data.status === "active") {
+    await syncSubscriptionDeliveries({ subscriptionId });
+  }
+
+  if (subscriptionId && parsed.data.status !== "active") {
+    const { error } = await supabase
+      .from("delivery_records")
+      .update({
+        status: "skipped",
+        note: "Subscription inactive",
+        expected_amount: 0,
+        due_amount: 0,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("subscription_id", subscriptionId)
+      .in("status", ["scheduled", "rescheduled"]);
+
+    if (error) {
+      throw error;
+    }
+  }
+
+  revalidatePath("/admin");
+  revalidatePath("/admin/customers");
+  revalidatePath("/admin/orders");
+  revalidatePath("/admin/subscriptions");
+  revalidatePath("/rider");
+  revalidatePath("/rider/deliveries");
+
+  return buildMutationResult(
+    "/admin/subscriptions",
+    parsed.data.id ? "Subscription updated." : "Subscription created.",
   );
 }
 
@@ -154,12 +243,19 @@ export async function saveRiderAction(input: RiderInput): Promise<MutationResult
   };
 
   if (parsed.data.id) {
-    await supabase.from("riders").update(payload).eq("id", parsed.data.id);
+    const { error } = await supabase.from("riders").update(payload).eq("id", parsed.data.id);
+    if (error) {
+      throw error;
+    }
   } else {
-    await supabase.from("riders").insert(payload);
+    const { error } = await supabase.from("riders").insert(payload);
+    if (error) {
+      throw error;
+    }
   }
 
   revalidatePath("/admin/riders");
+  revalidatePath("/admin/subscriptions");
 
   return buildMutationResult(
     "/admin/riders",
@@ -167,100 +263,70 @@ export async function saveRiderAction(input: RiderInput): Promise<MutationResult
   );
 }
 
-export async function saveOrderAction(input: OrderInput): Promise<MutationResult> {
-  const user = await requireUser("admin");
-  const parsed = orderSchema.safeParse(input);
+export async function saveOrderAction(): Promise<MutationResult> {
+  await requireUser("admin");
 
-  if (!parsed.success) {
-    return {
-      success: false,
-      message: "Please complete all order steps before saving.",
-    };
-  }
-
-  const totalAmount = parsed.data.bottleQty * parsed.data.pricePerBottle;
-  const now = new Date().toISOString();
-
-  const supabase = await createServerSupabaseClient();
-  let customerId = parsed.data.customerId;
-
-  if (!customerId) {
-    const { data: createdCustomer } = await supabase
-      .from("customers")
-      .insert({
-        name: parsed.data.newCustomerName,
-        phone: parsed.data.newCustomerPhone,
-        address: parsed.data.newCustomerAddress,
-        area: parsed.data.newCustomerArea,
-      })
-      .select("id")
-      .single();
-
-    customerId = createdCustomer?.id;
-  }
-
-  const orderPayload = {
-    customer_id: customerId,
-    rider_id: parsed.data.riderId,
-    bottle_qty: parsed.data.bottleQty,
-    price_per_bottle: parsed.data.pricePerBottle,
-    total_amount: totalAmount,
-    delivery_date: parsed.data.deliveryDate,
-    notes: parsed.data.notes || null,
-    order_status: parsed.data.id ? undefined : "assigned",
-    expected_payment_method: parsed.data.expectedPaymentMethod,
-    payment_status:
-      parsed.data.expectedPaymentMethod === "credit" ? "due" : "unpaid",
-    created_by: user.id,
-    updated_at: now,
+  return {
+    success: false,
+    message: "Manual daily orders have been replaced by subscriptions and delivery records.",
   };
-
-  if (parsed.data.id) {
-    await supabase.from("orders").update(orderPayload).eq("id", parsed.data.id);
-  } else {
-    const { data: createdOrder } = await supabase
-      .from("orders")
-      .insert({
-        ...orderPayload,
-        created_at: now,
-      })
-      .select("id")
-      .single();
-
-    if (createdOrder?.id && customerId) {
-      await supabase.from("ledger_entries").insert({
-        customer_id: customerId,
-        order_id: createdOrder.id,
-        entry_type: "order",
-        debit: totalAmount,
-        credit: 0,
-        description: "Order created",
-      });
-    }
-  }
-
-  revalidatePath("/admin/orders");
-
-  return buildMutationResult(
-    "/admin/orders",
-    parsed.data.id ? "Order updated." : "Order created and assigned.",
-  );
 }
 
 export async function cancelOrderAction(orderId: string) {
   await requireUser("admin");
 
   const supabase = await createServerSupabaseClient();
-  await supabase
-    .from("orders")
+  const { data: deliveryRecord, error: fetchError } = await supabase
+    .from("delivery_records")
+    .select("id, customer_id, subscription_id, expected_amount, status")
+    .eq("id", orderId)
+    .maybeSingle();
+
+  if (fetchError) {
+    throw fetchError;
+  }
+
+  if (!deliveryRecord) {
+    return buildMutationResult("/admin/orders", "Delivery already unavailable.");
+  }
+
+  const { error: updateError } = await supabase
+    .from("delivery_records")
     .update({
-      order_status: "cancelled",
+      status: "skipped",
+      note: "Cancelled by admin",
+      expected_amount: 0,
+      due_amount: 0,
       updated_at: new Date().toISOString(),
     })
     .eq("id", orderId);
 
+  if (updateError) {
+    throw updateError;
+  }
+
+  if (Number(deliveryRecord.expected_amount) > 0) {
+    const { error: ledgerError } = await supabase.from("ledger_entries").insert({
+      customer_id: deliveryRecord.customer_id,
+      subscription_id: deliveryRecord.subscription_id,
+      delivery_record_id: deliveryRecord.id,
+      entry_type: "adjustment",
+      debit: 0,
+      credit: Number(deliveryRecord.expected_amount),
+      description: "Delivery cancelled adjustment",
+    });
+
+    if (ledgerError) {
+      throw ledgerError;
+    }
+  }
+
+  revalidatePath("/admin");
   revalidatePath("/admin/orders");
-  return buildMutationResult("/admin/orders", "Order cancelled.");
+  revalidatePath("/rider");
+  revalidatePath("/rider/deliveries");
+
+  return buildMutationResult("/admin/orders", "Delivery cancelled.");
 }
 
 export async function cancelOrderFormAction(orderId: string) {
@@ -274,7 +340,17 @@ export async function reviewPaymentAction(
   const user = await requireUser("admin");
 
   const supabase = await createServerSupabaseClient();
-  await supabase
+  const { data: payment, error: paymentError } = await supabase
+    .from("payments")
+    .select("id, amount, customer_id, subscription_id, delivery_record_id")
+    .eq("id", paymentId)
+    .maybeSingle();
+
+  if (paymentError) {
+    throw paymentError;
+  }
+
+  const { error: updateError } = await supabase
     .from("payments")
     .update({
       payment_status: decision,
@@ -283,7 +359,44 @@ export async function reviewPaymentAction(
     })
     .eq("id", paymentId);
 
+  if (updateError) {
+    throw updateError;
+  }
+
+  if (payment?.delivery_record_id) {
+    const { error: deliveryError } = await supabase
+      .from("delivery_records")
+      .update({
+        collected_amount: decision === "verified" ? Number(payment.amount) : 0,
+        due_amount: decision === "verified" ? 0 : Number(payment.amount),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", payment.delivery_record_id);
+
+    if (deliveryError) {
+      throw deliveryError;
+    }
+
+    if (decision === "verified") {
+      const { error: ledgerError } = await supabase.from("ledger_entries").insert({
+        customer_id: payment.customer_id,
+        subscription_id: payment.subscription_id,
+        delivery_record_id: payment.delivery_record_id,
+        payment_id: payment.id,
+        entry_type: "payment",
+        debit: 0,
+        credit: Number(payment.amount),
+        description: "Verified online payment",
+      });
+
+      if (ledgerError) {
+        throw ledgerError;
+      }
+    }
+  }
+
   revalidatePath("/admin/payments");
+  revalidatePath("/admin/ledger");
 }
 
 export async function saveManualPaymentAction(
@@ -306,11 +419,12 @@ export async function saveManualPaymentAction(
   const paymentStatus =
     parsed.data.paymentMethod === "cash" ? "verified" : "pending_verification";
 
-  const { data: payment } = await supabase
+  const { data: payment, error: paymentError } = await supabase
     .from("payments")
     .insert({
-      order_id: parsed.data.orderId || null,
       customer_id: parsed.data.customerId,
+      subscription_id: parsed.data.subscriptionId || null,
+      delivery_record_id: parsed.data.deliveryRecordId || null,
       rider_id: parsed.data.riderId || null,
       amount: parsed.data.amount,
       payment_method: parsed.data.paymentMethod,
@@ -322,18 +436,56 @@ export async function saveManualPaymentAction(
     .select("id")
     .single();
 
-  await supabase.from("ledger_entries").insert({
+  if (paymentError) {
+    throw paymentError;
+  }
+
+  if (parsed.data.deliveryRecordId && paymentStatus === "verified") {
+    const { data: deliveryRecord, error: deliveryFetchError } = await supabase
+      .from("delivery_records")
+      .select("collected_amount, due_amount")
+      .eq("id", parsed.data.deliveryRecordId)
+      .maybeSingle();
+
+    if (deliveryFetchError) {
+      throw deliveryFetchError;
+    }
+
+    const collectedAmount = Number(deliveryRecord?.collected_amount ?? 0) + parsed.data.amount;
+    const dueAmount = Math.max(Number(deliveryRecord?.due_amount ?? 0) - parsed.data.amount, 0);
+
+    const { error: deliveryUpdateError } = await supabase
+      .from("delivery_records")
+      .update({
+        collected_amount: collectedAmount,
+        due_amount: dueAmount,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", parsed.data.deliveryRecordId);
+
+    if (deliveryUpdateError) {
+      throw deliveryUpdateError;
+    }
+  }
+
+  const { error: ledgerError } = await supabase.from("ledger_entries").insert({
     customer_id: parsed.data.customerId,
+    subscription_id: parsed.data.subscriptionId || null,
+    delivery_record_id: parsed.data.deliveryRecordId || null,
     payment_id: payment?.id,
-    order_id: parsed.data.orderId || null,
     entry_type: "payment",
     debit: 0,
     credit: parsed.data.amount,
     description: "Manual payment entry",
   });
 
+  if (ledgerError) {
+    throw ledgerError;
+  }
+
   revalidatePath("/admin/payments");
   revalidatePath("/admin/ledger");
+  revalidatePath("/admin/customers");
 
   return buildMutationResult("/admin/payments", "Payment recorded.");
 }
@@ -341,8 +493,9 @@ export async function saveManualPaymentAction(
 export async function markDeliveryAction(formData: FormData): Promise<MutationResult> {
   const user = await requireUser("rider");
   const payload = {
-    orderId: String(formData.get("orderId") || ""),
+    deliveryRecordId: String(formData.get("deliveryRecordId") || ""),
     deliveredQty: Number(formData.get("deliveredQty") || 0),
+    status: String(formData.get("status") || ""),
     paymentOutcome: String(formData.get("paymentOutcome") || ""),
     amountReceived: Number(formData.get("amountReceived") || 0),
     transactionReference: String(formData.get("transactionReference") || ""),
@@ -354,114 +507,197 @@ export async function markDeliveryAction(formData: FormData): Promise<MutationRe
   if (!parsed.success) {
     return {
       success: false,
-      message: "Please capture delivery quantity and payment outcome.",
+      message: "Please capture delivery status, quantity, and payment outcome.",
+    };
+  }
+
+  const supabase = await createServerSupabaseClient();
+  const { data: currentRecord, error: recordError } = await supabase
+    .from("delivery_records")
+    .select("id, customer_id, subscription_id, expected_amount, scheduled_bottles")
+    .eq("id", parsed.data.deliveryRecordId)
+    .maybeSingle();
+
+  if (recordError) {
+    throw recordError;
+  }
+
+  if (!currentRecord) {
+    return {
+      success: false,
+      message: "Delivery record was not found.",
     };
   }
 
   const proof = formData.get("proof");
-  const proofUrl = await uploadOptionalProof(proof instanceof File ? proof : null);
-  const totalAmount = Number(formData.get("totalAmount") || 0);
-  const remainingDue = Math.max(totalAmount - (parsed.data.amountReceived || 0), 0);
+  const proofUpload = await uploadOptionalProof(proof instanceof File ? proof : null);
+  const expectedAmount = Number(currentRecord.expected_amount ?? 0);
+  const scheduledBottles = Number(currentRecord.scheduled_bottles ?? 0);
+  const chargeAmount = getChargeAmount({
+    status: parsed.data.status,
+    scheduledBottles,
+    deliveredQty: parsed.data.deliveredQty,
+    expectedAmount,
+  });
 
   const paymentOutcomeMap: Record<
     DeliveryPaymentOutcome,
-    { method: PaymentMethod; orderPaymentStatus: string; recordStatus: string }
+    { method: PaymentMethod; paymentStatus: string; recordStatus: string }
   > = {
     cash_received: {
       method: "cash",
-      orderPaymentStatus: "paid",
+      paymentStatus: "verified",
       recordStatus: "verified",
     },
     online_claimed: {
       method: "bank_transfer",
-      orderPaymentStatus: "verification_pending",
+      paymentStatus: "pending_verification",
       recordStatus: "pending_verification",
     },
-    unpaid_due: {
+    credit_due: {
       method: "credit",
-      orderPaymentStatus: "due",
+      paymentStatus: "received",
       recordStatus: "received",
     },
     partial_payment: {
       method: "cash",
-      orderPaymentStatus: "partial",
+      paymentStatus: "received",
       recordStatus: "received",
     },
   };
 
   const mapping = paymentOutcomeMap[parsed.data.paymentOutcome];
+  const collectedAmount =
+    parsed.data.paymentOutcome === "online_claimed"
+      ? 0
+      : parsed.data.paymentOutcome === "credit_due"
+        ? 0
+        : parsed.data.amountReceived || 0;
+  const remainingDue =
+    parsed.data.paymentOutcome === "online_claimed"
+      ? chargeAmount
+      : Math.max(chargeAmount - collectedAmount, 0);
 
-  const supabase = await createServerSupabaseClient();
-
-  await supabase
-    .from("orders")
+  const { error: updateError } = await supabase
+    .from("delivery_records")
     .update({
-      delivered_qty: parsed.data.deliveredQty,
-      amount_received:
-        parsed.data.paymentOutcome === "online_claimed"
+      delivered_bottles:
+        parsed.data.status === "not_delivered" ||
+        parsed.data.status === "skipped" ||
+        parsed.data.status === "rescheduled"
           ? 0
-          : parsed.data.amountReceived || 0,
+          : parsed.data.deliveredQty,
+      status: parsed.data.status,
+      expected_amount: chargeAmount,
+      collected_amount: collectedAmount,
       due_amount: remainingDue,
-      payment_status: mapping.orderPaymentStatus,
-      order_status: "delivered",
+      delivered_at:
+        parsed.data.status === "delivered" || parsed.data.status === "partially_delivered"
+          ? new Date().toISOString()
+          : null,
       transaction_reference: parsed.data.transactionReference || null,
+      note: parsed.data.notes || null,
+      proof_url: proofUpload?.publicUrl || null,
       updated_at: new Date().toISOString(),
     })
-    .eq("id", parsed.data.orderId);
+    .eq("id", parsed.data.deliveryRecordId);
+
+  if (updateError) {
+    throw updateError;
+  }
+
+  const adjustmentAmount = Math.max(expectedAmount - chargeAmount, 0);
+
+  if (adjustmentAmount > 0) {
+    const { error: adjustmentError } = await supabase.from("ledger_entries").insert({
+      customer_id: currentRecord.customer_id,
+      subscription_id: currentRecord.subscription_id,
+      delivery_record_id: currentRecord.id,
+      entry_type: "adjustment",
+      debit: 0,
+      credit: adjustmentAmount,
+      description: "Delivery adjustment",
+    });
+
+    if (adjustmentError) {
+      throw adjustmentError;
+    }
+  }
 
   if (
-    parsed.data.paymentOutcome !== "unpaid_due" &&
-    (parsed.data.amountReceived || parsed.data.paymentOutcome === "online_claimed")
+    parsed.data.paymentOutcome !== "credit_due" &&
+    (collectedAmount > 0 || parsed.data.paymentOutcome === "online_claimed")
   ) {
-    const { data: payment } = await supabase
+    const paymentAmount =
+      parsed.data.paymentOutcome === "online_claimed" ? chargeAmount : collectedAmount;
+    const { data: payment, error: paymentError } = await supabase
       .from("payments")
       .insert({
-        order_id: parsed.data.orderId,
-        customer_id: String(formData.get("customerId")),
+        customer_id: currentRecord.customer_id,
+        subscription_id: currentRecord.subscription_id,
+        delivery_record_id: parsed.data.deliveryRecordId,
         rider_id: user.riderId || null,
-        amount:
-          parsed.data.paymentOutcome === "online_claimed"
-            ? totalAmount
-            : parsed.data.amountReceived || 0,
+        amount: paymentAmount,
         payment_method: mapping.method,
         payment_status: mapping.recordStatus,
         transaction_reference: parsed.data.transactionReference || null,
-        proof_url: proofUrl,
+        proof_url: proofUpload?.publicUrl || null,
         notes: parsed.data.notes || null,
         received_at: new Date().toISOString(),
       })
       .select("id")
       .single();
 
-    await supabase.from("ledger_entries").insert({
-      customer_id: String(formData.get("customerId")),
-      order_id: parsed.data.orderId,
-      payment_id: payment?.id,
-      entry_type: "payment",
-      debit: 0,
-      credit:
-        parsed.data.paymentOutcome === "online_claimed"
-          ? totalAmount
-          : parsed.data.amountReceived || 0,
-      description: "Delivery collection",
-    });
+    if (paymentError) {
+      throw paymentError;
+    }
+
+    if (proofUpload) {
+      await supabase.from("delivery_proofs").insert({
+        delivery_record_id: parsed.data.deliveryRecordId,
+        payment_id: payment?.id,
+        storage_path: proofUpload.path,
+        public_url: proofUpload.publicUrl,
+      });
+    }
+
+    if (parsed.data.paymentOutcome !== "online_claimed") {
+      const { error: ledgerError } = await supabase.from("ledger_entries").insert({
+        customer_id: currentRecord.customer_id,
+        subscription_id: currentRecord.subscription_id,
+        delivery_record_id: parsed.data.deliveryRecordId,
+        payment_id: payment?.id,
+        entry_type: "payment",
+        debit: 0,
+        credit: paymentAmount,
+        description: "Delivery collection",
+      });
+
+      if (ledgerError) {
+        throw ledgerError;
+      }
+    }
   }
 
   revalidatePath("/rider");
+  revalidatePath("/rider/deliveries");
+  revalidatePath("/rider/collections");
+  revalidatePath("/admin");
   revalidatePath("/admin/orders");
   revalidatePath("/admin/payments");
+  revalidatePath("/admin/ledger");
 
   const search = new URLSearchParams({
     amount:
       parsed.data.paymentOutcome === "online_claimed"
-        ? String(totalAmount)
-        : String(parsed.data.amountReceived || 0),
+        ? String(chargeAmount)
+        : String(collectedAmount),
     due: String(remainingDue),
     outcome: parsed.data.paymentOutcome,
   });
 
   return buildMutationResult(
-    `/rider/deliveries/${parsed.data.orderId}/success?${search.toString()}`,
+    `/rider/deliveries/${parsed.data.deliveryRecordId}/success?${search.toString()}`,
     "Delivery recorded.",
   );
 }

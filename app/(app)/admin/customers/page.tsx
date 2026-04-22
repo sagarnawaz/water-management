@@ -1,4 +1,4 @@
-﻿import Link from "next/link";
+import Link from "next/link";
 import { Plus, Search } from "lucide-react";
 
 import { EmptyState } from "@/components/empty-state";
@@ -8,7 +8,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { formatCurrency } from "@/lib/format";
 import { cn } from "@/lib/utils";
-import { listCustomerSummaries, listRiders } from "@/services/data";
+import { listCustomerSummaries } from "@/services/data";
 
 type CustomersPageProps = {
   searchParams: Promise<{
@@ -19,19 +19,15 @@ type CustomersPageProps = {
 
 export default async function CustomersPage({ searchParams }: CustomersPageProps) {
   const params = await searchParams;
-  const [customerSummaries, riders] = await Promise.all([
-    listCustomerSummaries(params.q),
-    listRiders(),
-  ]);
+  const customerSummaries = await listCustomerSummaries(params.q);
   const view = params.view === "list" ? "list" : "cards";
-  const riderMap = new Map(riders.map((rider) => [rider.id, rider.name]));
 
   return (
     <div className="space-y-6">
       <PageHeader
         eyebrow="Customers"
         title="Customer management"
-        description="Search customers, review service plans, and keep rider assignments and due balances aligned."
+        description="Search customers, review balances, and move from customer profiles into subscriptions and payments."
         actions={
           <Link
             href="/admin/customers/new"
@@ -101,22 +97,18 @@ export default async function CustomersPage({ searchParams }: CustomersPageProps
                 <div className="space-y-1 text-sm text-muted-foreground">
                   <p>{customer.address}</p>
                   <p>{customer.area}</p>
-                  <p>
-                    {customer.dailyBottleQty} bottles / day - {riderMap.get(customer.assignedRiderId ?? "") || "No rider assigned"}
-                  </p>
-                  <p>
-                    {customer.isActive ? "Active" : "Inactive"} - Month {customer.billingMonth}
-                  </p>
+                  <p>{totals.activeSubscriptions} active subscriptions</p>
+                  <p>{customer.isActive ? "Active customer" : "Inactive customer"}</p>
                 </div>
                 <div className="flex flex-wrap gap-2">
                   <Link href={`/admin/customers/${customer.id}`} className={cn(buttonVariants(), "rounded-2xl")}>
                     View details
                   </Link>
                   <Link
-                    href={`/admin/orders/new?customerId=${customer.id}`}
+                    href={`/admin/subscriptions/new?customerId=${customer.id}`}
                     className={cn(buttonVariants({ variant: "outline" }), "rounded-2xl")}
                   >
-                    Manual order
+                    Add subscription
                   </Link>
                   <Link
                     href={`/admin/payments/new?customerId=${customer.id}`}

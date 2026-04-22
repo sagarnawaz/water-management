@@ -40,16 +40,16 @@ export default async function OrdersPage({ searchParams }: OrdersPageProps) {
   return (
     <div className="space-y-6">
       <PageHeader
-        eyebrow="Orders"
-        title="Order management"
-        description="Handle dispatching, rider assignment, payment expectation, and cancellation without losing history."
+        eyebrow="Deliveries"
+        title="Delivery management"
+        description="Review scheduled delivery records, rider assignment, payment state, and cancellations without losing history."
         actions={
           <Link
-            href="/admin/orders/new"
+            href="/admin/subscriptions/new"
             className={cn(buttonVariants({ size: "lg" }), "h-12 rounded-2xl")}
           >
             <Plus className="size-4" />
-            Create order
+            Create subscription
           </Link>
         }
       />
@@ -75,15 +75,15 @@ export default async function OrdersPage({ searchParams }: OrdersPageProps) {
 
       {orders.length === 0 ? (
         <EmptyState
-          title="No orders in this filter"
-          description="Create a new order or switch the filter to review another stage of the dispatch pipeline."
+          title="No deliveries in this filter"
+          description="Create a subscription or switch the filter to review another stage of the delivery pipeline."
           action={
             <Link
-              href="/admin/orders/new"
+              href="/admin/subscriptions/new"
               className={cn(buttonVariants({ size: "lg" }), "h-12 rounded-2xl")}
             >
               <Plus className="size-4" />
-              Create order
+              Create subscription
             </Link>
           }
         />
@@ -142,7 +142,7 @@ export default async function OrdersPage({ searchParams }: OrdersPageProps) {
                         "rounded-2xl",
                       )}
                     >
-                      Cancel order
+                      Cancel delivery
                     </button>
                   </form>
                 </div>

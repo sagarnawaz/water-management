@@ -9,8 +9,8 @@ export default async function NewCustomerPage() {
     <div className="space-y-6">
       <PageHeader
         eyebrow="Customers"
-        title="Add customer plan"
-        description="Create the customer, assign the rider, choose the active billing month, and let daily orders flow automatically."
+        title="Add customer"
+        description="Create the customer profile first, then attach a subscription for daily service."
       />
       <CustomerForm riders={riders} />
     </div>

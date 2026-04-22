@@ -59,8 +59,9 @@ export function getNavigation(role: UserRole) {
     return [
       { id: "dashboard", href: "/admin", label: "Dashboard", icon: Home },
       { id: "customers", href: "/admin/customers", label: "Customers", icon: Users },
+      { id: "subscriptions", href: "/admin/subscriptions", label: "Subscriptions", icon: ClipboardList },
       { id: "riders", href: "/admin/riders", label: "Riders", icon: Truck },
-      { id: "orders", href: "/admin/orders", label: "Orders", icon: ClipboardList },
+      { id: "orders", href: "/admin/orders", label: "Deliveries", icon: Route },
       { id: "payments", href: "/admin/payments", label: "Payments", icon: CreditCard },
       { id: "ledger", href: "/admin/ledger", label: "Ledger", icon: ReceiptText },
       { id: "reports", href: "/admin/reports", label: "Reports", icon: BarChart3 },

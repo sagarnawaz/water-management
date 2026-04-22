@@ -2,12 +2,19 @@ import { z } from "zod";
 
 export const deliverySchema = z
   .object({
-    orderId: z.string().min(1),
-    deliveredQty: z.coerce.number().min(1, "Delivered quantity is required"),
+    deliveryRecordId: z.string().min(1),
+    deliveredQty: z.coerce.number().min(0, "Delivered quantity is required"),
+    status: z.enum([
+      "delivered",
+      "partially_delivered",
+      "not_delivered",
+      "skipped",
+      "rescheduled",
+    ]),
     paymentOutcome: z.enum([
       "cash_received",
       "online_claimed",
-      "unpaid_due",
+      "credit_due",
       "partial_payment",
     ]),
     amountReceived: z.coerce.number().min(0).optional(),
@@ -15,6 +22,17 @@ export const deliverySchema = z
     notes: z.string().optional(),
   })
   .superRefine((value, ctx) => {
+    if (
+      (value.status === "delivered" || value.status === "partially_delivered") &&
+      value.deliveredQty <= 0
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["deliveredQty"],
+        message: "Enter delivered bottles",
+      });
+    }
+
     if (
       (value.paymentOutcome === "cash_received" ||
         value.paymentOutcome === "partial_payment") &&
@@ -24,6 +42,14 @@ export const deliverySchema = z
         code: "custom",
         path: ["amountReceived"],
         message: "Enter the received amount",
+      });
+    }
+
+    if (value.paymentOutcome === "partial_payment" && value.status === "not_delivered") {
+      ctx.addIssue({
+        code: "custom",
+        path: ["status"],
+        message: "Partial payment requires a delivered quantity",
       });
     }
   });

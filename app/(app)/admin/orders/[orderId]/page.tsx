@@ -6,8 +6,8 @@ import { PageHeader } from "@/components/layout/page-header";
 import { StatusBadge } from "@/components/status-badge";
 import { buttonVariants } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { cn } from "@/lib/utils";
 import { formatCurrency, formatDate, formatDateTime } from "@/lib/format";
+import { cn } from "@/lib/utils";
 import { getOrder } from "@/services/data";
 
 type OrderDetailProps = {
@@ -25,17 +25,23 @@ export default async function OrderDetailPage({ params }: OrderDetailProps) {
   return (
     <div className="space-y-6">
       <PageHeader
-        eyebrow="Order detail"
+        eyebrow="Delivery detail"
         title={detail.order.orderNumber}
-        description={`${detail.customer.name} • ${detail.customer.address}`}
+        description={`${detail.customer.name} - ${detail.customer.address}`}
         actions={
           <>
-            <Link href={`/admin/orders/${detail.order.id}/edit`} className={cn(buttonVariants({ variant: "outline", size: "lg" }), "h-12 rounded-2xl")}>
-              Edit order
+            <Link
+              href={`/admin/orders/${detail.order.id}/edit`}
+              className={cn(buttonVariants({ variant: "outline", size: "lg" }), "h-12 rounded-2xl")}
+            >
+              Edit subscription
             </Link>
             <form action={cancelOrderFormAction.bind(null, detail.order.id)}>
-              <button type="submit" className={cn(buttonVariants({ variant: "destructive", size: "lg" }), "h-12 rounded-2xl")}>
-                Cancel order
+              <button
+                type="submit"
+                className={cn(buttonVariants({ variant: "destructive", size: "lg" }), "h-12 rounded-2xl")}
+              >
+                Cancel delivery
               </button>
             </form>
           </>
@@ -45,7 +51,7 @@ export default async function OrderDetailPage({ params }: OrderDetailProps) {
       <div className="grid gap-4 md:grid-cols-4">
         <Card><CardContent className="p-5"><p className="text-sm text-muted-foreground">Status</p><div className="mt-3"><StatusBadge status={detail.order.orderStatus} /></div></CardContent></Card>
         <Card><CardContent className="p-5"><p className="text-sm text-muted-foreground">Payment</p><div className="mt-3"><StatusBadge status={detail.order.paymentStatus} /></div></CardContent></Card>
-        <Card><CardContent className="p-5"><p className="text-sm text-muted-foreground">Total</p><p className="mt-2 text-3xl font-semibold">{formatCurrency(detail.order.totalAmount)}</p></CardContent></Card>
+        <Card><CardContent className="p-5"><p className="text-sm text-muted-foreground">Expected amount</p><p className="mt-2 text-3xl font-semibold">{formatCurrency(detail.order.totalAmount)}</p></CardContent></Card>
         <Card><CardContent className="p-5"><p className="text-sm text-muted-foreground">Due</p><p className="mt-2 text-3xl font-semibold">{formatCurrency(detail.order.dueAmount)}</p></CardContent></Card>
       </div>
 
@@ -57,8 +63,9 @@ export default async function OrderDetailPage({ params }: OrderDetailProps) {
             <p>Phone: {detail.customer.phone}</p>
             <p>Assigned rider: {detail.rider?.name || "Unassigned"}</p>
             <p>Bottle quantity: {detail.order.bottleQty}</p>
-            <p>Delivery date: {formatDateTime(detail.order.deliveryDate)}</p>
+            <p>Scheduled date: {formatDateTime(detail.order.deliveryDate)}</p>
             <p>Expected payment: {detail.order.expectedPaymentMethod.replaceAll("_", " ")}</p>
+            {detail.subscription ? <p>Subscription status: {detail.subscription.status}</p> : null}
             <p>Notes: {detail.order.notes || "None"}</p>
           </CardContent>
         </Card>

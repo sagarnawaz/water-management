@@ -8,8 +8,9 @@ const paymentMethods = paymentMethodOptions.map((item) => item.value) as [
 ];
 
 export const manualPaymentSchema = z.object({
-  orderId: z.string().optional(),
   customerId: z.string().min(1, "Customer is required"),
+  subscriptionId: z.string().optional(),
+  deliveryRecordId: z.string().optional(),
   riderId: z.string().optional(),
   amount: z.coerce.number().min(1, "Amount is required"),
   paymentMethod: z.enum(paymentMethods),

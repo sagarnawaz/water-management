@@ -1,191 +1,229 @@
 import "server-only";
 
-import { format } from "date-fns";
+import { endOfMonth, format, parseISO, startOfMonth } from "date-fns";
 import type { SupabaseClient } from "@supabase/supabase-js";
 
-import { getServiceDateKeys } from "@/lib/customer-service";
+import { getScheduledDeliveryDateKeys } from "@/lib/customer-service";
 import { createServiceRoleSupabaseClient } from "@/lib/supabase/admin";
 import type { PaymentMethod } from "@/types/domain";
 
 type SyncClient = SupabaseClient | null;
 
-type SubscriptionCustomerRow = {
-  id: string;
-  name: string;
-  daily_bottle_qty: number;
-  price_per_bottle: number;
-  default_payment_method: PaymentMethod;
-  assigned_rider_id: string | null;
-  billing_month: string;
-  service_start_date: string;
-  service_end_date: string;
-  is_active: boolean;
-};
-
-type ExistingSubscriptionOrderRow = {
+type SubscriptionRow = {
   id: string;
   customer_id: string;
-  service_day: string;
-  order_status: string;
+  rider_id: string | null;
+  bottles_per_delivery: number;
+  delivery_frequency: "daily" | "weekdays" | "custom_days";
+  delivery_days: number[] | null;
+  preferred_time_slot: string | null;
+  monthly_amount: number;
+  payment_method: PaymentMethod;
+  start_date: string;
+  end_date: string | null;
+  status: "active" | "inactive" | "paused" | "ended";
+};
+
+type ExistingDeliveryRow = {
+  id: string;
+  subscription_id: string;
+  scheduled_date: string;
+  status: string;
 };
 
 function getPrivilegedClient(client?: SyncClient) {
   return client ?? createServiceRoleSupabaseClient();
 }
 
-function getPaymentStatus(method: PaymentMethod) {
-  return method === "credit" ? "due" : "unpaid";
+function getWindowDates(windowStart?: Date, windowEnd?: Date) {
+  const start = windowStart ?? startOfMonth(new Date());
+  const end = windowEnd ?? endOfMonth(start);
+
+  return {
+    start,
+    end,
+    startKey: format(start, "yyyy-MM-dd"),
+    endKey: format(end, "yyyy-MM-dd"),
+  };
 }
 
-function buildDeliveryTimestamp(serviceDay: string) {
-  return `${serviceDay}T09:00:00.000Z`;
+function getScheduledDaysInMonth(subscription: SubscriptionRow, scheduledDate: string) {
+  const monthStart = startOfMonth(parseISO(`${scheduledDate}T00:00:00`));
+  const monthEnd = endOfMonth(monthStart);
+
+  return getScheduledDeliveryDateKeys({
+    startDate: subscription.start_date,
+    endDate: subscription.end_date,
+    deliveryFrequency: subscription.delivery_frequency,
+    deliveryDays: subscription.delivery_days ?? [],
+    windowStart: monthStart,
+    windowEnd: monthEnd,
+  }).length;
 }
 
-export async function syncCustomerSubscriptionOrders(options?: {
+function getExpectedAmount(subscription: SubscriptionRow, scheduledDate: string) {
+  const scheduledDays = getScheduledDaysInMonth(subscription, scheduledDate);
+
+  if (scheduledDays <= 0) {
+    return 0;
+  }
+
+  return Number((subscription.monthly_amount / scheduledDays).toFixed(2));
+}
+
+function getInitialDueAmount(paymentMethod: PaymentMethod, expectedAmount: number) {
+  if (expectedAmount <= 0) {
+    return 0;
+  }
+
+  return paymentMethod === "credit" ? expectedAmount : expectedAmount;
+}
+
+export async function syncSubscriptionDeliveries(options?: {
   customerId?: string;
+  subscriptionId?: string;
   client?: SyncClient;
+  windowStart?: Date;
+  windowEnd?: Date;
 }) {
   const supabase = getPrivilegedClient(options?.client);
   if (!supabase) {
     return;
   }
 
-  let customerQuery = supabase.from("customers").select(`
-      id,
-      name,
-      daily_bottle_qty,
-      price_per_bottle,
-      default_payment_method,
-      assigned_rider_id,
-      billing_month,
-      service_start_date,
-      service_end_date,
-      is_active
-    `);
+  const { start, end, startKey, endKey } = getWindowDates(options?.windowStart, options?.windowEnd);
 
-  if (options?.customerId) {
-    customerQuery = customerQuery.eq("id", options.customerId);
-  }
-
-  const { data: customerRows, error: customerError } = await customerQuery;
-
-  if (customerError) {
-    throw customerError;
-  }
-
-  const customers = (customerRows ?? []) as SubscriptionCustomerRow[];
-  const eligibleCustomers = customers.filter(
-    (customer) =>
-      customer.is_active &&
-      customer.assigned_rider_id &&
-      customer.daily_bottle_qty > 0 &&
-      customer.price_per_bottle > 0,
+  let subscriptionQuery = supabase.from("subscriptions").select(
+    [
+      "id",
+      "customer_id",
+      "rider_id",
+      "bottles_per_delivery",
+      "delivery_frequency",
+      "delivery_days",
+      "preferred_time_slot",
+      "monthly_amount",
+      "payment_method",
+      "start_date",
+      "end_date",
+      "status",
+    ].join(", "),
   );
 
-  if (eligibleCustomers.length === 0) {
+  if (options?.customerId) {
+    subscriptionQuery = subscriptionQuery.eq("customer_id", options.customerId);
+  }
+
+  if (options?.subscriptionId) {
+    subscriptionQuery = subscriptionQuery.eq("id", options.subscriptionId);
+  }
+
+  const { data: subscriptionRows, error: subscriptionError } = await subscriptionQuery;
+
+  if (subscriptionError) {
+    throw subscriptionError;
+  }
+
+  const subscriptions = ((subscriptionRows ?? []) as SubscriptionRow[]).filter(
+    (subscription) =>
+      subscription.status === "active" &&
+      subscription.bottles_per_delivery > 0 &&
+      subscription.start_date <= endKey &&
+      (!subscription.end_date || subscription.end_date >= startKey),
+  );
+
+  if (subscriptions.length === 0) {
     return;
   }
 
-  const customerIds = eligibleCustomers.map((customer) => customer.id);
-  const { data: existingOrderRows, error: orderError } = await supabase
-    .from("orders")
-    .select("id, customer_id, service_day, order_status")
-    .in("customer_id", customerIds)
-    .eq("is_subscription_order", true)
-    .not("service_day", "is", null);
+  const subscriptionIds = subscriptions.map((subscription) => subscription.id);
+  const { data: existingRows, error: existingError } = await supabase
+    .from("delivery_records")
+    .select("id, subscription_id, scheduled_date, status")
+    .in("subscription_id", subscriptionIds)
+    .gte("scheduled_date", startKey)
+    .lte("scheduled_date", endKey);
 
-  if (orderError) {
-    throw orderError;
+  if (existingError) {
+    throw existingError;
   }
 
-  const existingOrders = (existingOrderRows ?? []) as ExistingSubscriptionOrderRow[];
-  const existingOrderMap = new Map(
-    existingOrders.map((order) => [`${order.customer_id}:${order.service_day}`, order]),
+  const existingMap = new Map(
+    ((existingRows ?? []) as ExistingDeliveryRow[]).map((row) => [
+      `${row.subscription_id}:${row.scheduled_date}`,
+      row,
+    ]),
   );
 
-  const todayKey = format(new Date(), "yyyy-MM-dd");
-  const insertRows: Array<Record<string, unknown>> = [];
-  const updateRows: Array<Record<string, unknown>> = [];
+  const inserts: Array<Record<string, unknown>> = [];
+  const updates: Array<Record<string, unknown>> = [];
 
-  for (const customer of eligibleCustomers) {
-    const serviceDays = getServiceDateKeys({
-      serviceStartDate: customer.service_start_date,
-      serviceEndDate: customer.service_end_date,
+  for (const subscription of subscriptions) {
+    const scheduledDates = getScheduledDeliveryDateKeys({
+      startDate: subscription.start_date,
+      endDate: subscription.end_date,
+      deliveryFrequency: subscription.delivery_frequency,
+      deliveryDays: subscription.delivery_days ?? [],
+      windowStart: start,
+      windowEnd: end,
     });
 
-    if (serviceDays.length === 0) {
-      continue;
-    }
+    for (const scheduledDate of scheduledDates) {
+      const existing = existingMap.get(`${subscription.id}:${scheduledDate}`);
+      const expectedAmount = getExpectedAmount(subscription, scheduledDate);
+      const basePayload = {
+        customer_id: subscription.customer_id,
+        subscription_id: subscription.id,
+        rider_id: subscription.rider_id,
+        scheduled_date: scheduledDate,
+        scheduled_time_slot: subscription.preferred_time_slot,
+        scheduled_bottles: subscription.bottles_per_delivery,
+        expected_amount: expectedAmount,
+        due_amount: getInitialDueAmount(subscription.payment_method, expectedAmount),
+        updated_at: new Date().toISOString(),
+      };
 
-    const totalAmount = customer.daily_bottle_qty * customer.price_per_bottle;
-
-    for (const serviceDay of serviceDays) {
-      const existingOrder = existingOrderMap.get(`${customer.id}:${serviceDay}`);
-
-      if (existingOrder) {
-        if (
-          serviceDay === todayKey &&
-          (existingOrder.order_status === "assigned" || existingOrder.order_status === "today")
-        ) {
-          updateRows.push({
-            id: existingOrder.id,
-            rider_id: customer.assigned_rider_id,
-            bottle_qty: customer.daily_bottle_qty,
-            price_per_bottle: customer.price_per_bottle,
-            total_amount: totalAmount,
-            due_amount: totalAmount,
-            expected_payment_method: customer.default_payment_method,
-            payment_status: getPaymentStatus(customer.default_payment_method),
-            delivery_date: buildDeliveryTimestamp(serviceDay),
-            updated_at: new Date().toISOString(),
-          });
-        }
+      if (!existing) {
+        inserts.push({
+          ...basePayload,
+          collected_amount: 0,
+          status: "scheduled",
+          created_at: new Date().toISOString(),
+        });
         continue;
       }
 
-      insertRows.push({
-        customer_id: customer.id,
-        rider_id: customer.assigned_rider_id,
-        bottle_qty: customer.daily_bottle_qty,
-        price_per_bottle: customer.price_per_bottle,
-        total_amount: totalAmount,
-        amount_received: 0,
-        due_amount: totalAmount,
-        delivery_date: buildDeliveryTimestamp(serviceDay),
-        notes: `Auto-generated daily delivery for ${customer.name}`,
-        order_status: "assigned",
-        expected_payment_method: customer.default_payment_method,
-        payment_status: getPaymentStatus(customer.default_payment_method),
-        created_by: null,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-        service_day: serviceDay,
-        is_subscription_order: true,
-      });
+      if (existing.status === "scheduled" || existing.status === "rescheduled") {
+        updates.push({
+          id: existing.id,
+          ...basePayload,
+        });
+      }
     }
   }
 
-  if (insertRows.length > 0) {
-    const { data: insertedOrders, error: insertError } = await supabase
-      .from("orders")
-      .upsert(insertRows, {
-        onConflict: "customer_id,service_day",
+  if (inserts.length > 0) {
+    const { data: insertedRows, error: insertError } = await supabase
+      .from("delivery_records")
+      .upsert(inserts, {
+        onConflict: "subscription_id,scheduled_date",
         ignoreDuplicates: true,
       })
-      .select("id, customer_id, service_day, total_amount");
+      .select("id, customer_id, subscription_id, scheduled_date, expected_amount");
 
     if (insertError) {
       throw insertError;
     }
 
-    if ((insertedOrders ?? []).length > 0) {
-      const ledgerRows = (insertedOrders ?? []).map((order) => ({
-        customer_id: order.customer_id,
-        order_id: order.id,
-        entry_type: "order",
-        debit: order.total_amount,
+    if ((insertedRows ?? []).length > 0) {
+      const ledgerRows = (insertedRows ?? []).map((row) => ({
+        customer_id: row.customer_id,
+        subscription_id: row.subscription_id,
+        delivery_record_id: row.id,
+        entry_type: "delivery",
+        debit: row.expected_amount,
         credit: 0,
-        description: `Auto daily order for ${order.service_day}`,
+        description: `Scheduled delivery for ${row.scheduled_date}`,
       }));
 
       const { error: ledgerError } = await supabase.from("ledger_entries").insert(ledgerRows);
@@ -196,18 +234,15 @@ export async function syncCustomerSubscriptionOrders(options?: {
   }
 
   await Promise.all(
-    updateRows.map((row) =>
+    updates.map((row) =>
       supabase
-        .from("orders")
+        .from("delivery_records")
         .update({
           rider_id: row.rider_id,
-          bottle_qty: row.bottle_qty,
-          price_per_bottle: row.price_per_bottle,
-          total_amount: row.total_amount,
+          scheduled_time_slot: row.scheduled_time_slot,
+          scheduled_bottles: row.scheduled_bottles,
+          expected_amount: row.expected_amount,
           due_amount: row.due_amount,
-          expected_payment_method: row.expected_payment_method,
-          payment_status: row.payment_status,
-          delivery_date: row.delivery_date,
           updated_at: row.updated_at,
         })
         .eq("id", String(row.id)),
@@ -215,7 +250,7 @@ export async function syncCustomerSubscriptionOrders(options?: {
   );
 }
 
-export async function cancelPendingSubscriptionOrders(
+export async function cancelUpcomingDeliveryRecordsForCustomer(
   customerId: string,
   client?: SyncClient,
 ) {
@@ -227,15 +262,15 @@ export async function cancelPendingSubscriptionOrders(
   const todayKey = format(new Date(), "yyyy-MM-dd");
 
   const { error } = await supabase
-    .from("orders")
+    .from("delivery_records")
     .update({
-      order_status: "cancelled",
+      status: "skipped",
+      note: "Subscription inactive",
       updated_at: new Date().toISOString(),
     })
     .eq("customer_id", customerId)
-    .eq("is_subscription_order", true)
-    .gte("service_day", todayKey)
-    .in("order_status", ["assigned", "today"]);
+    .gte("scheduled_date", todayKey)
+    .in("status", ["scheduled", "rescheduled"]);
 
   if (error) {
     throw error;

@@ -3,11 +3,12 @@ import "server-only";
 import { cache } from "react";
 import { format, isSameDay, parseISO, startOfDay, startOfMonth, startOfWeek } from "date-fns";
 
-import { getServiceSummary } from "@/lib/customer-service";
 import { createServerSupabaseClient } from "@/lib/supabase/server";
-import { syncCustomerSubscriptionOrders } from "@/services/subscription-sync";
+import { syncSubscriptionDeliveries } from "@/services/subscription-sync";
 import type {
   Customer,
+  DeliveryRecord,
+  DeliveryRecordStatus,
   LedgerEntry,
   Order,
   OrderPaymentStatus,
@@ -16,10 +17,14 @@ import type {
   PaymentMethod,
   PaymentRecordStatus,
   Rider,
+  RiderCollectionSummary,
   SessionUser,
+  Subscription,
 } from "@/types/domain";
 
 const todayDate = () => startOfDay(new Date());
+const SUBSCRIPTION_SYNC_WINDOW_MS = 5 * 60 * 1000;
+
 const CUSTOMER_SELECT = [
   "id",
   "name",
@@ -28,16 +33,10 @@ const CUSTOMER_SELECT = [
   "address",
   "area",
   "notes",
-  "daily_bottle_qty",
-  "price_per_bottle",
-  "default_payment_method",
-  "assigned_rider_id",
-  "billing_month",
-  "service_start_date",
-  "service_end_date",
-  "is_active",
   "created_at",
+  "is_active",
 ].join(", ");
+
 const RIDER_SELECT = [
   "id",
   "auth_user_id",
@@ -47,32 +46,53 @@ const RIDER_SELECT = [
   "status",
   "created_at",
 ].join(", ");
-const ORDER_SELECT = [
+
+const SUBSCRIPTION_SELECT = [
   "id",
   "customer_id",
   "rider_id",
-  "bottle_qty",
-  "delivered_qty",
-  "price_per_bottle",
-  "total_amount",
-  "amount_received",
-  "due_amount",
-  "delivery_date",
-  "notes",
-  "order_status",
-  "expected_payment_method",
-  "payment_status",
-  "created_by",
+  "bottles_per_delivery",
+  "delivery_frequency",
+  "delivery_days",
+  "preferred_time_slot",
+  "monthly_amount",
+  "payment_method",
+  "billing_cycle",
+  "start_date",
+  "end_date",
+  "status",
   "created_at",
   "updated_at",
-  "service_day",
-  "is_subscription_order",
-  "transaction_reference",
 ].join(", ");
+
+const DELIVERY_SELECT = [
+  "id",
+  "customer_id",
+  "subscription_id",
+  "rider_id",
+  "scheduled_date",
+  "scheduled_time_slot",
+  "scheduled_bottles",
+  "delivered_bottles",
+  "status",
+  "expected_amount",
+  "collected_amount",
+  "due_amount",
+  "delivered_at",
+  "transaction_reference",
+  "note",
+  "proof_url",
+  "legacy_order_id",
+  "created_at",
+  "updated_at",
+].join(", ");
+
 const PAYMENT_SELECT = [
   "id",
   "order_id",
   "customer_id",
+  "subscription_id",
+  "delivery_record_id",
   "rider_id",
   "amount",
   "payment_method",
@@ -84,10 +104,13 @@ const PAYMENT_SELECT = [
   "received_at",
   "notes",
 ].join(", ");
+
 const LEDGER_SELECT = [
   "id",
   "customer_id",
   "order_id",
+  "subscription_id",
+  "delivery_record_id",
   "payment_id",
   "entry_type",
   "debit",
@@ -96,12 +119,12 @@ const LEDGER_SELECT = [
   "description",
   "created_at",
 ].join(", ");
-const SUBSCRIPTION_SYNC_WINDOW_MS = 5 * 60 * 1000;
+
 let lastSubscriptionSyncAt = 0;
 let subscriptionSyncPromise: Promise<void> | null = null;
 
-function buildOrderNumber(id: string) {
-  return `ORD-${id.replaceAll("-", "").slice(0, 6).toUpperCase()}`;
+function buildDeliveryNumber(id: string) {
+  return `DLV-${id.replaceAll("-", "").slice(0, 6).toUpperCase()}`;
 }
 
 function buildLocationUrl(address?: string) {
@@ -134,13 +157,6 @@ function mapCustomer(row: Record<string, unknown>): Customer {
     address: String(row.address ?? ""),
     area: String(row.area ?? ""),
     notes: row.notes ? String(row.notes) : undefined,
-    dailyBottleQty: toNumber(row.daily_bottle_qty) || 1,
-    pricePerBottle: toNumber(row.price_per_bottle) || 180,
-    paymentMethod: String(row.default_payment_method ?? "cash") as PaymentMethod,
-    assignedRiderId: row.assigned_rider_id ? String(row.assigned_rider_id) : undefined,
-    billingMonth: String(row.billing_month ?? format(new Date(), "yyyy-MM-01")),
-    serviceStartDate: String(row.service_start_date ?? format(new Date(), "yyyy-MM-dd")),
-    serviceEndDate: String(row.service_end_date ?? format(new Date(), "yyyy-MM-dd")),
     createdAt: String(row.created_at ?? new Date().toISOString()),
     isActive: row.is_active === undefined ? true : Boolean(row.is_active),
   };
@@ -158,43 +174,67 @@ function mapRider(row: Record<string, unknown>): Rider {
   };
 }
 
-function mapOrder(row: Record<string, unknown>, customer?: Customer): Order {
+function mapSubscription(row: Record<string, unknown>): Subscription {
   return {
     id: String(row.id),
-    orderNumber: buildOrderNumber(String(row.id)),
     customerId: String(row.customer_id ?? ""),
     riderId: row.rider_id ? String(row.rider_id) : undefined,
-    bottleQty: toNumber(row.bottle_qty),
-    deliveredQty:
-      row.delivered_qty === null || row.delivered_qty === undefined
-        ? undefined
-        : toNumber(row.delivered_qty),
-    pricePerBottle: toNumber(row.price_per_bottle),
-    totalAmount: toNumber(row.total_amount),
-    amountReceived: toNumber(row.amount_received),
-    dueAmount: toNumber(row.due_amount),
-    deliveryDate: String(row.delivery_date ?? new Date().toISOString()),
-    notes: row.notes ? String(row.notes) : undefined,
-    orderStatus: String(row.order_status ?? "assigned") as OrderStatus,
-    expectedPaymentMethod: String(row.expected_payment_method ?? "cash") as PaymentMethod,
-    paymentStatus: String(row.payment_status ?? "unpaid") as OrderPaymentStatus,
-    createdBy: row.created_by ? String(row.created_by) : "",
+    bottlesPerDelivery: toNumber(row.bottles_per_delivery),
+    deliveryFrequency: String(row.delivery_frequency ?? "daily") as Subscription["deliveryFrequency"],
+    deliveryDays: Array.isArray(row.delivery_days)
+      ? row.delivery_days.map((value) => toNumber(value))
+      : [],
+    preferredTimeSlot: row.preferred_time_slot ? String(row.preferred_time_slot) : undefined,
+    monthlyAmount: toNumber(row.monthly_amount),
+    paymentMethod: String(row.payment_method ?? "cash") as PaymentMethod,
+    billingCycle: String(row.billing_cycle ?? "monthly") as Subscription["billingCycle"],
+    startDate: String(row.start_date ?? format(new Date(), "yyyy-MM-dd")),
+    endDate: row.end_date ? String(row.end_date) : undefined,
+    status: String(row.status ?? "active") as Subscription["status"],
     createdAt: String(row.created_at ?? new Date().toISOString()),
     updatedAt: String(row.updated_at ?? new Date().toISOString()),
-    serviceDay: row.service_day ? String(row.service_day) : undefined,
-    isSubscriptionOrder: Boolean(row.is_subscription_order),
+  };
+}
+
+function mapDeliveryRecord(row: Record<string, unknown>, customer?: Customer): DeliveryRecord {
+  return {
+    id: String(row.id),
+    customerId: String(row.customer_id ?? ""),
+    subscriptionId: String(row.subscription_id ?? ""),
+    riderId: row.rider_id ? String(row.rider_id) : undefined,
+    scheduledDate: String(row.scheduled_date ?? format(new Date(), "yyyy-MM-dd")),
+    scheduledTimeSlot: row.scheduled_time_slot ? String(row.scheduled_time_slot) : undefined,
+    scheduledBottles: toNumber(row.scheduled_bottles),
+    deliveredBottles:
+      row.delivered_bottles === null || row.delivered_bottles === undefined
+        ? undefined
+        : toNumber(row.delivered_bottles),
+    status: String(row.status ?? "scheduled") as DeliveryRecordStatus,
+    expectedAmount: toNumber(row.expected_amount),
+    collectedAmount: toNumber(row.collected_amount),
+    dueAmount: toNumber(row.due_amount),
+    deliveredAt: row.delivered_at ? String(row.delivered_at) : undefined,
     transactionReference: row.transaction_reference
       ? String(row.transaction_reference)
       : undefined,
+    note: row.note ? String(row.note) : undefined,
+    proofUrl: row.proof_url ? String(row.proof_url) : undefined,
+    createdAt: String(row.created_at ?? new Date().toISOString()),
+    updatedAt: String(row.updated_at ?? new Date().toISOString()),
     locationUrl: buildLocationUrl(customer?.address),
   };
 }
 
 function mapPayment(row: Record<string, unknown>): Payment {
+  const deliveryRecordId = row.delivery_record_id ? String(row.delivery_record_id) : undefined;
+  const legacyOrderId = row.order_id ? String(row.order_id) : undefined;
+
   return {
     id: String(row.id),
-    orderId: row.order_id ? String(row.order_id) : undefined,
     customerId: String(row.customer_id ?? ""),
+    subscriptionId: row.subscription_id ? String(row.subscription_id) : undefined,
+    deliveryRecordId,
+    orderId: legacyOrderId ?? deliveryRecordId,
     riderId: row.rider_id ? String(row.rider_id) : undefined,
     amount: toNumber(row.amount),
     paymentMethod: String(row.payment_method ?? "cash") as PaymentMethod,
@@ -211,10 +251,15 @@ function mapPayment(row: Record<string, unknown>): Payment {
 }
 
 function mapLedger(row: Record<string, unknown>): LedgerEntry {
+  const deliveryRecordId = row.delivery_record_id ? String(row.delivery_record_id) : undefined;
+  const legacyOrderId = row.order_id ? String(row.order_id) : undefined;
+
   return {
     id: String(row.id),
     customerId: String(row.customer_id ?? ""),
-    orderId: row.order_id ? String(row.order_id) : undefined,
+    subscriptionId: row.subscription_id ? String(row.subscription_id) : undefined,
+    deliveryRecordId,
+    orderId: legacyOrderId ?? deliveryRecordId,
     paymentId: row.payment_id ? String(row.payment_id) : undefined,
     entryType: String(row.entry_type ?? "adjustment") as LedgerEntry["entryType"],
     debit: toNumber(row.debit),
@@ -245,6 +290,80 @@ function computeRunningLedger(entries: LedgerEntry[]) {
     });
 }
 
+function getOrderStatus(record: DeliveryRecord): OrderStatus {
+  if (record.status === "delivered") {
+    return "delivered";
+  }
+
+  if (record.status === "partially_delivered") {
+    return "pending_payment";
+  }
+
+  if (record.status === "not_delivered" || record.status === "skipped") {
+    return "cancelled";
+  }
+
+  if (isSameDay(parseISO(`${record.scheduledDate}T00:00:00`), todayDate())) {
+    return "today";
+  }
+
+  return "assigned";
+}
+
+function getOrderPaymentStatus(
+  record: DeliveryRecord,
+  subscription?: Subscription,
+  payments: Payment[] = [],
+): OrderPaymentStatus {
+  if (payments.some((payment) => payment.paymentStatus === "pending_verification")) {
+    return "verification_pending";
+  }
+
+  if (record.expectedAmount > 0 && record.dueAmount <= 0) {
+    return "paid";
+  }
+
+  if (record.collectedAmount > 0 && record.dueAmount > 0) {
+    return "partial";
+  }
+
+  if (record.dueAmount > 0 && subscription?.paymentMethod === "credit") {
+    return "due";
+  }
+
+  return "unpaid";
+}
+
+function toOrderView(
+  record: DeliveryRecord,
+  subscription?: Subscription,
+  customer?: Customer,
+  payments: Payment[] = [],
+): Order {
+  return {
+    id: record.id,
+    orderNumber: buildDeliveryNumber(record.id),
+    customerId: record.customerId,
+    subscriptionId: record.subscriptionId,
+    riderId: record.riderId,
+    bottleQty: record.scheduledBottles,
+    deliveredQty: record.deliveredBottles,
+    totalAmount: record.expectedAmount,
+    amountReceived: record.collectedAmount,
+    dueAmount: record.dueAmount,
+    deliveryDate: record.deliveredAt ?? `${record.scheduledDate}T09:00:00.000Z`,
+    notes: record.note,
+    orderStatus: getOrderStatus(record),
+    expectedPaymentMethod: subscription?.paymentMethod ?? "cash",
+    paymentStatus: getOrderPaymentStatus(record, subscription, payments),
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    transactionReference: record.transactionReference,
+    proofUrl: record.proofUrl,
+    locationUrl: buildLocationUrl(customer?.address),
+  };
+}
+
 function filterOrdersByStatus(orders: Order[], filter = "all") {
   if (filter === "all") {
     return orders;
@@ -267,43 +386,7 @@ function filterOrdersByStatus(orders: Order[], filter = "all") {
   return orders.filter((order) => order.orderStatus === filter);
 }
 
-async function fetchCustomersByIds(ids: string[]) {
-  if (ids.length === 0) {
-    return [];
-  }
-
-  const supabase = await createServerSupabaseClient();
-  const { data, error } = await supabase
-    .from("customers")
-    .select(CUSTOMER_SELECT)
-    .in("id", ids);
-
-  if (error) {
-    throw error;
-  }
-
-  return (data ?? []).map((row) => mapCustomer(row as Record<string, unknown>));
-}
-
-async function fetchOrdersByIds(ids: string[]) {
-  if (ids.length === 0) {
-    return [];
-  }
-
-  const supabase = await createServerSupabaseClient();
-  const { data, error } = await supabase
-    .from("orders")
-    .select(ORDER_SELECT)
-    .in("id", ids);
-
-  if (error) {
-    throw error;
-  }
-
-  return (data ?? []).map((row) => mapOrder(row as Record<string, unknown>));
-}
-
-async function maybeSyncSubscriptionOrders() {
+async function maybeSyncDeliveryRecords() {
   const now = Date.now();
 
   if (now - lastSubscriptionSyncAt < SUBSCRIPTION_SYNC_WINDOW_MS) {
@@ -312,7 +395,7 @@ async function maybeSyncSubscriptionOrders() {
 
   if (!subscriptionSyncPromise) {
     subscriptionSyncPromise = (async () => {
-      await syncCustomerSubscriptionOrders();
+      await syncSubscriptionDeliveries();
       lastSubscriptionSyncAt = Date.now();
     })().finally(() => {
       subscriptionSyncPromise = null;
@@ -350,25 +433,39 @@ const getAllRiders = cache(async () => {
   return (data ?? []).map((row) => mapRider(row as Record<string, unknown>));
 });
 
-const getAllOrders = cache(async () => {
-  await maybeSyncSubscriptionOrders();
+const getAllSubscriptions = cache(async () => {
+  const supabase = await createServerSupabaseClient();
+  const { data, error } = await supabase
+    .from("subscriptions")
+    .select(SUBSCRIPTION_SELECT)
+    .order("created_at", { ascending: false });
 
-  const [customerList, supabase] = await Promise.all([
+  if (error) {
+    throw error;
+  }
+
+  return (data ?? []).map((row) => mapSubscription(row as Record<string, unknown>));
+});
+
+const getAllDeliveryRecords = cache(async () => {
+  await maybeSyncDeliveryRecords();
+
+  const [customers, supabase] = await Promise.all([
     getAllCustomers(),
     createServerSupabaseClient(),
   ]);
-  const customerMap = new Map(customerList.map((customer) => [customer.id, customer]));
+  const customerMap = new Map(customers.map((customer) => [customer.id, customer]));
   const { data, error } = await supabase
-    .from("orders")
-    .select(ORDER_SELECT)
-    .order("delivery_date", { ascending: false });
+    .from("delivery_records")
+    .select(DELIVERY_SELECT)
+    .order("scheduled_date", { ascending: false });
 
   if (error) {
     throw error;
   }
 
   return (data ?? []).map((row) =>
-    mapOrder(
+    mapDeliveryRecord(
       row as Record<string, unknown>,
       customerMap.get(String((row as Record<string, unknown>).customer_id)),
     ),
@@ -388,6 +485,42 @@ const getAllPayments = cache(async () => {
 
   return (data ?? []).map((row) => mapPayment(row as Record<string, unknown>));
 });
+
+async function fetchCustomersByIds(ids: string[]) {
+  if (ids.length === 0) {
+    return [];
+  }
+
+  const supabase = await createServerSupabaseClient();
+  const { data, error } = await supabase
+    .from("customers")
+    .select(CUSTOMER_SELECT)
+    .in("id", ids);
+
+  if (error) {
+    throw error;
+  }
+
+  return (data ?? []).map((row) => mapCustomer(row as Record<string, unknown>));
+}
+
+async function fetchDeliveryRecordsByIds(ids: string[]) {
+  if (ids.length === 0) {
+    return [];
+  }
+
+  const supabase = await createServerSupabaseClient();
+  const { data, error } = await supabase
+    .from("delivery_records")
+    .select(DELIVERY_SELECT)
+    .in("id", ids);
+
+  if (error) {
+    throw error;
+  }
+
+  return (data ?? []).map((row) => mapDeliveryRecord(row as Record<string, unknown>));
+}
 
 async function resolveEffectiveRiderId(user: SessionUser) {
   if (user.riderId) {
@@ -425,35 +558,66 @@ export async function listCustomers(query?: string) {
 }
 
 export async function listCustomerSummaries(query?: string) {
-  const [customers, orders, payments] = await Promise.all([
+  const [customers, subscriptions, deliveries, payments] = await Promise.all([
     listCustomers(query),
-    getAllOrders(),
+    getAllSubscriptions(),
+    getAllDeliveryRecords(),
     getAllPayments(),
   ]);
 
-  const totalsByCustomer = new Map<string, { totalOrders: number; totalPaid: number }>();
+  const totalsByCustomer = new Map<
+    string,
+    { totalDeliveries: number; totalPaid: number; activeSubscriptions: number }
+  >();
 
-  for (const order of orders) {
-    const totals = totalsByCustomer.get(order.customerId) ?? { totalOrders: 0, totalPaid: 0 };
-    totals.totalOrders += order.totalAmount;
-    totalsByCustomer.set(order.customerId, totals);
+  for (const delivery of deliveries) {
+    const totals = totalsByCustomer.get(delivery.customerId) ?? {
+      totalDeliveries: 0,
+      totalPaid: 0,
+      activeSubscriptions: 0,
+    };
+    totals.totalDeliveries += delivery.expectedAmount;
+    totalsByCustomer.set(delivery.customerId, totals);
   }
 
   for (const payment of payments) {
-    const totals = totalsByCustomer.get(payment.customerId) ?? { totalOrders: 0, totalPaid: 0 };
+    const totals = totalsByCustomer.get(payment.customerId) ?? {
+      totalDeliveries: 0,
+      totalPaid: 0,
+      activeSubscriptions: 0,
+    };
     totals.totalPaid += payment.amount;
     totalsByCustomer.set(payment.customerId, totals);
   }
 
+  for (const subscription of subscriptions) {
+    if (subscription.status !== "active") {
+      continue;
+    }
+
+    const totals = totalsByCustomer.get(subscription.customerId) ?? {
+      totalDeliveries: 0,
+      totalPaid: 0,
+      activeSubscriptions: 0,
+    };
+    totals.activeSubscriptions += 1;
+    totalsByCustomer.set(subscription.customerId, totals);
+  }
+
   return customers.map((customer) => {
-    const totals = totalsByCustomer.get(customer.id) ?? { totalOrders: 0, totalPaid: 0 };
+    const totals = totalsByCustomer.get(customer.id) ?? {
+      totalDeliveries: 0,
+      totalPaid: 0,
+      activeSubscriptions: 0,
+    };
 
     return {
       customer,
       totals: {
-        totalOrders: totals.totalOrders,
+        totalOrders: totals.totalDeliveries,
         totalPaid: totals.totalPaid,
-        currentDue: Math.max(totals.totalOrders - totals.totalPaid, 0),
+        currentDue: Math.max(totals.totalDeliveries - totals.totalPaid, 0),
+        activeSubscriptions: totals.activeSubscriptions,
       },
     };
   });
@@ -463,24 +627,75 @@ export async function listRiders() {
   return getAllRiders();
 }
 
+export async function listSubscriptions() {
+  return getAllSubscriptions();
+}
+
+export async function listDeliveryRecords() {
+  return getAllDeliveryRecords();
+}
+
 export async function listOrders(filter = "all") {
-  const orders = await getAllOrders();
+  const [deliveries, subscriptions, customers, payments] = await Promise.all([
+    getAllDeliveryRecords(),
+    getAllSubscriptions(),
+    getAllCustomers(),
+    getAllPayments(),
+  ]);
+  const subscriptionMap = new Map(subscriptions.map((subscription) => [subscription.id, subscription]));
+  const customerMap = new Map(customers.map((customer) => [customer.id, customer]));
+  const paymentsByDelivery = new Map<string, Payment[]>();
+
+  for (const payment of payments) {
+    if (!payment.deliveryRecordId) {
+      continue;
+    }
+
+    const list = paymentsByDelivery.get(payment.deliveryRecordId) ?? [];
+    list.push(payment);
+    paymentsByDelivery.set(payment.deliveryRecordId, list);
+  }
+
+  const orders = deliveries.map((delivery) =>
+    toOrderView(
+      delivery,
+      subscriptionMap.get(delivery.subscriptionId),
+      customerMap.get(delivery.customerId),
+      paymentsByDelivery.get(delivery.id),
+    ),
+  );
+
   return filterOrdersByStatus(orders, filter);
 }
 
 export async function getCustomer(id: string) {
   const supabase = await createServerSupabaseClient();
-  const [
-    customerResult,
-    ordersResult,
-    paymentsResult,
-    ledgerResult,
-  ] = await Promise.all([
-    supabase.from("customers").select(CUSTOMER_SELECT).eq("id", id).maybeSingle(),
-    supabase.from("orders").select(ORDER_SELECT).eq("customer_id", id).order("delivery_date", { ascending: false }),
-    supabase.from("payments").select(PAYMENT_SELECT).eq("customer_id", id).order("received_at", { ascending: false }),
-    supabase.from("ledger_entries").select(LEDGER_SELECT).eq("customer_id", id).order("created_at", { ascending: true }),
-  ]);
+  await maybeSyncDeliveryRecords();
+
+  const [customerResult, subscriptionsResult, deliveriesResult, paymentsResult, ledgerResult] =
+    await Promise.all([
+      supabase.from("customers").select(CUSTOMER_SELECT).eq("id", id).maybeSingle(),
+      supabase
+        .from("subscriptions")
+        .select(SUBSCRIPTION_SELECT)
+        .eq("customer_id", id)
+        .order("created_at", { ascending: false }),
+      supabase
+        .from("delivery_records")
+        .select(DELIVERY_SELECT)
+        .eq("customer_id", id)
+        .order("scheduled_date", { ascending: false }),
+      supabase
+        .from("payments")
+        .select(PAYMENT_SELECT)
+        .eq("customer_id", id)
+        .order("received_at", { ascending: false }),
+      supabase
+        .from("ledger_entries")
+        .select(LEDGER_SELECT)
+        .eq("customer_id", id)
+        .order("created_at", { ascending: true }),
+    ]);
 
   if (customerResult.error) {
     throw customerResult.error;
@@ -494,8 +709,12 @@ export async function getCustomer(id: string) {
     return null;
   }
 
-  if (ordersResult.error) {
-    throw ordersResult.error;
+  if (subscriptionsResult.error) {
+    throw subscriptionsResult.error;
+  }
+
+  if (deliveriesResult.error) {
+    throw deliveriesResult.error;
   }
 
   if (paymentsResult.error) {
@@ -506,44 +725,134 @@ export async function getCustomer(id: string) {
     throw ledgerResult.error;
   }
 
-  const customerOrders = (ordersResult.data ?? []).map((row) =>
-    mapOrder(row as Record<string, unknown>, customer),
+  const subscriptions = (subscriptionsResult.data ?? []).map((row) =>
+    mapSubscription(row as Record<string, unknown>),
   );
-  const customerPayments = (paymentsResult.data ?? []).map((row) =>
-    mapPayment(row as Record<string, unknown>),
+  const payments = (paymentsResult.data ?? []).map((row) => mapPayment(row as Record<string, unknown>));
+  const paymentsByDelivery = new Map<string, Payment[]>();
+
+  for (const payment of payments) {
+    if (!payment.deliveryRecordId) {
+      continue;
+    }
+
+    const list = paymentsByDelivery.get(payment.deliveryRecordId) ?? [];
+    list.push(payment);
+    paymentsByDelivery.set(payment.deliveryRecordId, list);
+  }
+
+  const deliveryRecords = (deliveriesResult.data ?? []).map((row) =>
+    mapDeliveryRecord(row as Record<string, unknown>, customer),
   );
-  const customerLedger = computeRunningLedger(
+  const subscriptionMap = new Map(subscriptions.map((subscription) => [subscription.id, subscription]));
+  const orders = deliveryRecords.map((delivery) =>
+    toOrderView(
+      delivery,
+      subscriptionMap.get(delivery.subscriptionId),
+      customer,
+      paymentsByDelivery.get(delivery.id),
+    ),
+  );
+  const ledger = computeRunningLedger(
     (ledgerResult.data ?? []).map((row) => mapLedger(row as Record<string, unknown>)),
   );
-
-  const totalOrders = customerOrders.reduce((sum, order) => sum + order.totalAmount, 0);
-  const totalPaid = customerPayments.reduce((sum, payment) => sum + payment.amount, 0);
+  const activeSubscriptions = subscriptions.filter((subscription) => subscription.status === "active");
+  const totalScheduledValue = deliveryRecords.reduce((sum, delivery) => sum + delivery.expectedAmount, 0);
+  const totalPaid = payments.reduce((sum, payment) => sum + payment.amount, 0);
 
   return {
     customer,
-    orders: customerOrders,
-    payments: customerPayments,
-    ledger: customerLedger,
-    serviceSummary: getServiceSummary({
-      billingMonth: customer.billingMonth,
-      serviceStartDate: customer.serviceStartDate,
-      dailyBottleQty: customer.dailyBottleQty,
-      pricePerBottle: customer.pricePerBottle,
-    }),
+    subscriptions,
+    activeSubscriptions,
+    deliveryRecords,
+    orders,
+    payments,
+    ledger,
     totals: {
-      totalOrders,
+      totalOrders: totalScheduledValue,
       totalPaid,
-      currentDue: Math.max(totalOrders - totalPaid, 0),
+      currentDue: Math.max(totalScheduledValue - totalPaid, 0),
     },
+  };
+}
+
+export async function getSubscription(id: string) {
+  const supabase = await createServerSupabaseClient();
+  const [subscriptionResult, deliveriesResult] = await Promise.all([
+    supabase.from("subscriptions").select(SUBSCRIPTION_SELECT).eq("id", id).maybeSingle(),
+    supabase
+      .from("delivery_records")
+      .select(DELIVERY_SELECT)
+      .eq("subscription_id", id)
+      .order("scheduled_date", { ascending: false }),
+  ]);
+
+  if (subscriptionResult.error) {
+    throw subscriptionResult.error;
+  }
+
+  if (deliveriesResult.error) {
+    throw deliveriesResult.error;
+  }
+
+  const subscription = subscriptionResult.data
+    ? mapSubscription(subscriptionResult.data as Record<string, unknown>)
+    : null;
+
+  if (!subscription) {
+    return null;
+  }
+
+  const [customerResult, riderResult] = await Promise.all([
+    supabase
+      .from("customers")
+      .select(CUSTOMER_SELECT)
+      .eq("id", subscription.customerId)
+      .maybeSingle(),
+    subscription.riderId
+      ? supabase.from("riders").select(RIDER_SELECT).eq("id", subscription.riderId).maybeSingle()
+      : Promise.resolve({ data: null, error: null }),
+  ]);
+
+  if (customerResult.error) {
+    throw customerResult.error;
+  }
+
+  if (riderResult.error) {
+    throw riderResult.error;
+  }
+
+  return {
+    subscription,
+    customer: customerResult.data
+      ? mapCustomer(customerResult.data as Record<string, unknown>)
+      : undefined,
+    rider: riderResult.data ? mapRider(riderResult.data as Record<string, unknown>) : undefined,
+    deliveryRecords: (deliveriesResult.data ?? []).map((row) =>
+      mapDeliveryRecord(row as Record<string, unknown>),
+    ),
   };
 }
 
 export async function getRider(id: string) {
   const supabase = await createServerSupabaseClient();
-  const [riderResult, ordersResult, paymentsResult] = await Promise.all([
+  const [riderResult, subscriptionResult, deliveriesResult, paymentsResult] = await Promise.all([
     supabase.from("riders").select(RIDER_SELECT).eq("id", id).maybeSingle(),
-    supabase.from("orders").select(ORDER_SELECT).eq("rider_id", id).order("delivery_date", { ascending: false }),
-    supabase.from("payments").select(PAYMENT_SELECT).eq("rider_id", id).order("received_at", { ascending: false }),
+    supabase
+      .from("subscriptions")
+      .select(SUBSCRIPTION_SELECT)
+      .eq("rider_id", id)
+      .order("created_at", { ascending: false }),
+    supabase
+      .from("delivery_records")
+      .select(DELIVERY_SELECT)
+      .eq("rider_id", id)
+      .order("scheduled_date", { ascending: false }),
+    supabase
+      .from("payments")
+      .select(PAYMENT_SELECT)
+      .eq("rider_id", id)
+      .order("received_at", { ascending: false }),
   ]);
 
   if (riderResult.error) {
@@ -558,35 +867,66 @@ export async function getRider(id: string) {
     return null;
   }
 
-  if (ordersResult.error) {
-    throw ordersResult.error;
+  if (subscriptionResult.error) {
+    throw subscriptionResult.error;
+  }
+
+  if (deliveriesResult.error) {
+    throw deliveriesResult.error;
   }
 
   if (paymentsResult.error) {
     throw paymentsResult.error;
   }
 
-  const riderOrders = (ordersResult.data ?? []).map((row) =>
-    mapOrder(row as Record<string, unknown>),
+  const subscriptions = (subscriptionResult.data ?? []).map((row) =>
+    mapSubscription(row as Record<string, unknown>),
   );
-  const riderPayments = (paymentsResult.data ?? []).map((row) =>
-    mapPayment(row as Record<string, unknown>),
+  const deliveryRecords = (deliveriesResult.data ?? []).map((row) =>
+    mapDeliveryRecord(row as Record<string, unknown>),
   );
-  const deliveredOrders = riderOrders.filter((order) => order.orderStatus === "delivered");
+  const payments = (paymentsResult.data ?? []).map((row) => mapPayment(row as Record<string, unknown>));
+  const subscriptionMap = new Map(subscriptions.map((subscription) => [subscription.id, subscription]));
+  const customers = await fetchCustomersByIds(
+    Array.from(new Set(deliveryRecords.map((delivery) => delivery.customerId))),
+  );
+  const customerMap = new Map(customers.map((customer) => [customer.id, customer]));
+  const paymentsByDelivery = new Map<string, Payment[]>();
+
+  for (const payment of payments) {
+    if (!payment.deliveryRecordId) {
+      continue;
+    }
+
+    const list = paymentsByDelivery.get(payment.deliveryRecordId) ?? [];
+    list.push(payment);
+    paymentsByDelivery.set(payment.deliveryRecordId, list);
+  }
+
+  const orders = deliveryRecords.map((delivery) =>
+    toOrderView(
+      delivery,
+      subscriptionMap.get(delivery.subscriptionId),
+      customerMap.get(delivery.customerId),
+      paymentsByDelivery.get(delivery.id),
+    ),
+  );
+  const deliveredOrders = orders.filter((order) => order.orderStatus === "delivered");
 
   return {
     rider,
-    orders: riderOrders,
-    payments: riderPayments,
+    subscriptions,
+    deliveryRecords,
+    orders,
+    payments,
     totals: {
-      todayDeliveries: riderOrders.filter((order) =>
-        isSameDay(parseISO(order.deliveryDate), todayDate()),
-      ).length,
+      todayDeliveries: orders.filter((order) => isSameDay(parseISO(order.deliveryDate), todayDate()))
+        .length,
       deliveredOrders: deliveredOrders.length,
-      totalCollectedCash: riderPayments
+      totalCollectedCash: payments
         .filter((payment) => payment.paymentMethod === "cash")
         .reduce((sum, payment) => sum + payment.amount, 0),
-      pendingReconciliation: riderPayments
+      pendingReconciliation: payments
         .filter((payment) => payment.paymentStatus === "pending_verification")
         .reduce((sum, payment) => sum + payment.amount, 0),
     },
@@ -595,30 +935,51 @@ export async function getRider(id: string) {
 
 export async function getOrder(id: string) {
   const supabase = await createServerSupabaseClient();
-  const orderResult = await supabase.from("orders").select(ORDER_SELECT).eq("id", id).maybeSingle();
+  await maybeSyncDeliveryRecords();
 
-  if (orderResult.error) {
-    throw orderResult.error;
+  const deliveryResult = await supabase
+    .from("delivery_records")
+    .select(DELIVERY_SELECT)
+    .or(`id.eq.${id},legacy_order_id.eq.${id}`)
+    .maybeSingle();
+
+  if (deliveryResult.error) {
+    throw deliveryResult.error;
   }
 
-  const orderRow = orderResult.data as Record<string, unknown> | null;
+  const deliveryRow = deliveryResult.data as Record<string, unknown> | null;
 
-  if (!orderRow) {
+  if (!deliveryRow) {
     return null;
   }
 
-  const customerId = String(orderRow.customer_id ?? "");
-  const riderId = orderRow.rider_id ? String(orderRow.rider_id) : null;
-  const [customerResult, riderResult, paymentsResult, ledgerResult] = await Promise.all([
-    customerId
-      ? supabase.from("customers").select(CUSTOMER_SELECT).eq("id", customerId).maybeSingle()
-      : Promise.resolve({ data: null, error: null }),
-    riderId
-      ? supabase.from("riders").select(RIDER_SELECT).eq("id", riderId).maybeSingle()
-      : Promise.resolve({ data: null, error: null }),
-    supabase.from("payments").select(PAYMENT_SELECT).eq("order_id", id).order("received_at", { ascending: false }),
-    supabase.from("ledger_entries").select(LEDGER_SELECT).eq("order_id", id).order("created_at", { ascending: true }),
-  ]);
+  const deliveryRecord = mapDeliveryRecord(deliveryRow);
+  const [customerResult, riderResult, subscriptionResult, paymentsResult, ledgerResult] =
+    await Promise.all([
+      supabase
+        .from("customers")
+        .select(CUSTOMER_SELECT)
+        .eq("id", deliveryRecord.customerId)
+        .maybeSingle(),
+      deliveryRecord.riderId
+        ? supabase.from("riders").select(RIDER_SELECT).eq("id", deliveryRecord.riderId).maybeSingle()
+        : Promise.resolve({ data: null, error: null }),
+      supabase
+        .from("subscriptions")
+        .select(SUBSCRIPTION_SELECT)
+        .eq("id", deliveryRecord.subscriptionId)
+        .maybeSingle(),
+      supabase
+        .from("payments")
+        .select(PAYMENT_SELECT)
+        .eq("delivery_record_id", deliveryRecord.id)
+        .order("received_at", { ascending: false }),
+      supabase
+        .from("ledger_entries")
+        .select(LEDGER_SELECT)
+        .eq("delivery_record_id", deliveryRecord.id)
+        .order("created_at", { ascending: true }),
+    ]);
 
   if (customerResult.error) {
     throw customerResult.error;
@@ -626,6 +987,10 @@ export async function getOrder(id: string) {
 
   if (riderResult.error) {
     throw riderResult.error;
+  }
+
+  if (subscriptionResult.error) {
+    throw subscriptionResult.error;
   }
 
   if (paymentsResult.error) {
@@ -639,25 +1004,19 @@ export async function getOrder(id: string) {
   const customer = customerResult.data
     ? mapCustomer(customerResult.data as Record<string, unknown>)
     : undefined;
-  const order = mapOrder(orderRow, customer);
-
-  const rider = riderResult.data
-    ? mapRider(riderResult.data as Record<string, unknown>)
+  const subscription = subscriptionResult.data
+    ? mapSubscription(subscriptionResult.data as Record<string, unknown>)
     : undefined;
-
-  const payments = (paymentsResult.data ?? []).map((row) =>
-    mapPayment(row as Record<string, unknown>),
-  );
+  const rider = riderResult.data ? mapRider(riderResult.data as Record<string, unknown>) : undefined;
+  const payments = (paymentsResult.data ?? []).map((row) => mapPayment(row as Record<string, unknown>));
   const ledger = computeRunningLedger(
     (ledgerResult.data ?? []).map((row) => mapLedger(row as Record<string, unknown>)),
   );
 
-  if (!order) {
-    return null;
-  }
-
   return {
-    order,
+    deliveryRecord: customer ? { ...deliveryRecord, locationUrl: buildLocationUrl(customer.address) } : deliveryRecord,
+    order: toOrderView(deliveryRecord, subscription, customer, payments),
+    subscription,
     customer,
     rider,
     payments,
@@ -666,37 +1025,63 @@ export async function getOrder(id: string) {
 }
 
 export async function getAdminDashboardData() {
-  const [customers, riders, orders, payments] = await Promise.all([
+  const [customers, riders, subscriptions, deliveries, payments] = await Promise.all([
     getAllCustomers(),
     getAllRiders(),
-    getAllOrders(),
+    getAllSubscriptions(),
+    getAllDeliveryRecords(),
     getAllPayments(),
   ]);
 
-  const todayOrders = filterOrdersByStatus(orders, "today");
-  const deliveredToday = todayOrders.filter((order) => order.orderStatus === "delivered");
+  const customerMap = new Map(customers.map((customer) => [customer.id, customer]));
+  const subscriptionMap = new Map(
+    subscriptions.map((subscription) => [subscription.id, subscription]),
+  );
+  const paymentsByDelivery = new Map<string, Payment[]>();
+
+  for (const payment of payments) {
+    if (!payment.deliveryRecordId) {
+      continue;
+    }
+
+    const list = paymentsByDelivery.get(payment.deliveryRecordId) ?? [];
+    list.push(payment);
+    paymentsByDelivery.set(payment.deliveryRecordId, list);
+  }
+
+  const orders = deliveries.map((delivery) =>
+    toOrderView(
+      delivery,
+      subscriptionMap.get(delivery.subscriptionId),
+      customerMap.get(delivery.customerId),
+      paymentsByDelivery.get(delivery.id),
+    ),
+  );
+  const todayOrders = orders.filter((order) => isSameDay(parseISO(order.deliveryDate), todayDate()));
+  const deliveredToday = todayOrders.filter(
+    (order) => order.orderStatus === "delivered" || order.orderStatus === "pending_payment",
+  );
   const pendingVerification = payments.filter(
     (payment) => payment.paymentStatus === "pending_verification",
   );
-
-  const totalDue = orders.reduce((sum, order) => sum + order.dueAmount, 0);
-  const cashCollectedToday = payments
-    .filter(
-      (payment) =>
-        payment.paymentMethod === "cash" &&
-        isSameDay(parseISO(payment.receivedAt), todayDate()),
-    )
-    .reduce((sum, payment) => sum + payment.amount, 0);
-  const customerMap = new Map(customers.map((customer) => [customer.id, customer]));
+  const customerSummaries = await listCustomerSummaries();
 
   return {
-    customerCount: customers.length,
-    riderCount: riders.length,
+    customerCount: customers.filter((customer) => customer.isActive).length,
+    riderCount: riders.filter((rider) => rider.status === "active").length,
+    activeSubscriptionCount: subscriptions.filter((subscription) => subscription.status === "active")
+      .length,
     todayOrdersCount: todayOrders.length,
     deliveredOrdersCount: deliveredToday.length,
     pendingPaymentsCount: pendingVerification.length,
-    totalDue,
-    cashCollectedToday,
+    totalDue: deliveries.reduce((sum, delivery) => sum + delivery.dueAmount, 0),
+    cashCollectedToday: payments
+      .filter(
+        (payment) =>
+          payment.paymentMethod === "cash" &&
+          isSameDay(parseISO(payment.receivedAt), todayDate()),
+      )
+      .reduce((sum, payment) => sum + payment.amount, 0),
     recentOrders: [...orders]
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
       .slice(0, 4)
@@ -704,26 +1089,21 @@ export async function getAdminDashboardData() {
         ...order,
         customerName: customerMap.get(order.customerId)?.name ?? "Customer",
       })),
-    pendingDues: customers
-      .map((customer) => {
-        const customerOrders = orders.filter((order) => order.customerId === customer.id);
-        const customerPayments = payments.filter((payment) => payment.customerId === customer.id);
-
-        return {
-          customer,
-          dueAmount: Math.max(
-            customerOrders.reduce((sum, order) => sum + order.totalAmount, 0) -
-              customerPayments.reduce((sum, payment) => sum + payment.amount, 0),
-            0,
-          ),
-        };
-      })
+    pendingDues: customerSummaries
+      .map((summary) => ({
+        customer: summary.customer,
+        dueAmount: summary.totals.currentDue,
+      }))
       .filter((item) => item.dueAmount > 0)
       .sort((a, b) => b.dueAmount - a.dueAmount)
       .slice(0, 4),
-    riderCollectionSummary: riders.map((rider) => {
+    riderCollectionSummary: riders.map<RiderCollectionSummary>((rider) => {
       const riderPayments = payments.filter((payment) => payment.riderId === rider.id);
       const riderOrders = orders.filter((order) => order.riderId === rider.id);
+      const completedDeliveries = riderOrders.filter(
+        (order) => order.orderStatus === "delivered" || order.orderStatus === "pending_payment",
+      ).length;
+      const missedDeliveries = riderOrders.filter((order) => order.orderStatus === "cancelled").length;
 
       return {
         riderId: rider.id,
@@ -737,44 +1117,86 @@ export async function getAdminDashboardData() {
         pendingReconciliation: riderPayments
           .filter((payment) => payment.paymentStatus === "pending_verification")
           .reduce((sum, payment) => sum + payment.amount, 0),
-        deliveredCount: riderOrders.filter((order) => order.orderStatus === "delivered").length,
+        completedDeliveries,
+        missedDeliveries,
+        deliveredCount: completedDeliveries,
       };
     }),
   };
 }
 
 export async function getPendingPayments() {
-  const [payments, customers, riders, orders] = await Promise.all([
+  const [payments, customers, riders, deliveryRecords, subscriptions] = await Promise.all([
     getAllPayments(),
     getAllCustomers(),
     getAllRiders(),
-    getAllOrders(),
+    getAllDeliveryRecords(),
+    getAllSubscriptions(),
   ]);
+  const customerMap = new Map(customers.map((customer) => [customer.id, customer]));
+  const riderMap = new Map(riders.map((rider) => [rider.id, rider]));
+  const deliveryMap = new Map(deliveryRecords.map((delivery) => [delivery.id, delivery]));
+  const subscriptionMap = new Map(subscriptions.map((subscription) => [subscription.id, subscription]));
 
   return payments
     .filter((payment) => payment.paymentStatus === "pending_verification")
-    .map((payment) => ({
-      ...payment,
-      customer: customers.find((customer) => customer.id === payment.customerId),
-      rider: riders.find((rider) => rider.id === payment.riderId),
-      order: orders.find((order) => order.id === payment.orderId),
-    }));
+    .map((payment) => {
+      const delivery = payment.deliveryRecordId
+        ? deliveryMap.get(payment.deliveryRecordId)
+        : undefined;
+      const customer = customerMap.get(payment.customerId);
+
+      return {
+        ...payment,
+        customer,
+        rider: payment.riderId ? riderMap.get(payment.riderId) : undefined,
+        order:
+          delivery && customer
+            ? toOrderView(
+                delivery,
+                delivery.subscriptionId
+                  ? subscriptionMap.get(delivery.subscriptionId)
+                  : undefined,
+                customer,
+                [payment],
+              )
+            : undefined,
+      };
+    });
 }
 
 export async function getPaymentHistory() {
-  const [payments, customers, riders, orders] = await Promise.all([
+  const [payments, customers, riders, deliveryRecords, subscriptions] = await Promise.all([
     getAllPayments(),
     getAllCustomers(),
     getAllRiders(),
-    getAllOrders(),
+    getAllDeliveryRecords(),
+    getAllSubscriptions(),
   ]);
+  const customerMap = new Map(customers.map((customer) => [customer.id, customer]));
+  const riderMap = new Map(riders.map((rider) => [rider.id, rider]));
+  const deliveryMap = new Map(deliveryRecords.map((delivery) => [delivery.id, delivery]));
+  const subscriptionMap = new Map(subscriptions.map((subscription) => [subscription.id, subscription]));
 
-  return payments.map((payment) => ({
-    ...payment,
-    customer: customers.find((customer) => customer.id === payment.customerId),
-    rider: riders.find((rider) => rider.id === payment.riderId),
-    order: orders.find((order) => order.id === payment.orderId),
-  }));
+  return payments.map((payment) => {
+    const delivery = payment.deliveryRecordId ? deliveryMap.get(payment.deliveryRecordId) : undefined;
+    const customer = customerMap.get(payment.customerId);
+
+    return {
+      ...payment,
+      customer,
+      rider: payment.riderId ? riderMap.get(payment.riderId) : undefined,
+      order:
+        delivery && customer
+          ? toOrderView(
+              delivery,
+              delivery.subscriptionId ? subscriptionMap.get(delivery.subscriptionId) : undefined,
+              customer,
+              [payment],
+            )
+          : undefined,
+    };
+  });
 }
 
 export async function getReportSummary(
@@ -785,11 +1207,12 @@ export async function getReportSummary(
     paymentMethod?: string;
   },
 ) {
-  const [orders, payments, riders, customers] = await Promise.all([
-    getAllOrders(),
+  const [deliveries, payments, riders, customers, subscriptions] = await Promise.all([
+    getAllDeliveryRecords(),
     getAllPayments(),
     getAllRiders(),
     getAllCustomers(),
+    getAllSubscriptions(),
   ]);
 
   const boundary =
@@ -800,17 +1223,17 @@ export async function getReportSummary(
         : startOfMonth(todayDate());
 
   const customerMap = new Map(customers.map((customer) => [customer.id, customer]));
-  const scopedOrders = orders.filter(
-    (order) => parseISO(order.createdAt).getTime() >= boundary.getTime(),
+  const scopedDeliveries = deliveries.filter(
+    (delivery) => parseISO(`${delivery.scheduledDate}T00:00:00`).getTime() >= boundary.getTime(),
   );
   const scopedPayments = payments.filter(
     (payment) => parseISO(payment.receivedAt).getTime() >= boundary.getTime(),
   );
 
-  const filteredOrders = scopedOrders.filter((order) => {
-    const customer = customerMap.get(order.customerId);
+  const filteredDeliveries = scopedDeliveries.filter((delivery) => {
+    const customer = customerMap.get(delivery.customerId);
 
-    if (filters?.rider && filters.rider !== "all" && order.riderId !== filters.rider) {
+    if (filters?.rider && filters.rider !== "all" && delivery.riderId !== filters.rider) {
       return false;
     }
 
@@ -851,37 +1274,53 @@ export async function getReportSummary(
         : range === "weekly"
           ? `Week of ${format(boundary, "dd MMM yyyy")}`
           : format(boundary, "MMMM yyyy"),
-    totalOrders: filteredOrders.length,
-    deliveredOrders: filteredOrders.filter((order) => order.orderStatus === "delivered").length,
+    totalScheduledDeliveries: filteredDeliveries.length,
+    completedDeliveries: filteredDeliveries.filter((delivery) =>
+      delivery.status === "delivered" || delivery.status === "partially_delivered",
+    ).length,
+    missedDeliveries: filteredDeliveries.filter((delivery) =>
+      delivery.status === "not_delivered" || delivery.status === "skipped",
+    ).length,
+    totalOrders: filteredDeliveries.length,
+    deliveredOrders: filteredDeliveries.filter((delivery) =>
+      delivery.status === "delivered" || delivery.status === "partially_delivered",
+    ).length,
     cashCollected: filteredPayments
       .filter((payment) => payment.paymentMethod === "cash")
       .reduce((sum, payment) => sum + payment.amount, 0),
     pendingVerification: filteredPayments
       .filter((payment) => payment.paymentStatus === "pending_verification")
       .reduce((sum, payment) => sum + payment.amount, 0),
-    totalDue: filteredOrders.reduce((sum, order) => sum + order.dueAmount, 0),
+    totalDue: filteredDeliveries.reduce((sum, delivery) => sum + delivery.dueAmount, 0),
     riderWiseCollection: riders
       .filter((rider) => !filters?.rider || filters.rider === "all" || rider.id === filters.rider)
-      .map((rider) => ({
-        riderId: rider.id,
-        riderName: rider.name,
-        cashCollected: filteredPayments
-          .filter((payment) => payment.riderId === rider.id && payment.paymentMethod === "cash")
-          .reduce((sum, payment) => sum + payment.amount, 0),
-        onlineClaimed: filteredPayments
-          .filter((payment) => payment.riderId === rider.id && payment.paymentMethod !== "cash")
-          .reduce((sum, payment) => sum + payment.amount, 0),
-        pendingReconciliation: filteredPayments
-          .filter(
-            (payment) =>
-              payment.riderId === rider.id &&
-              payment.paymentStatus === "pending_verification",
-          )
-          .reduce((sum, payment) => sum + payment.amount, 0),
-        deliveredCount: filteredOrders.filter(
-          (order) => order.riderId === rider.id && order.orderStatus === "delivered",
-        ).length,
-      })),
+      .map<RiderCollectionSummary>((rider) => {
+        const riderPayments = filteredPayments.filter((payment) => payment.riderId === rider.id);
+        const riderDeliveries = filteredDeliveries.filter((delivery) => delivery.riderId === rider.id);
+        const completedDeliveries = riderDeliveries.filter(
+          (delivery) => delivery.status === "delivered" || delivery.status === "partially_delivered",
+        ).length;
+
+        return {
+          riderId: rider.id,
+          riderName: rider.name,
+          cashCollected: riderPayments
+            .filter((payment) => payment.paymentMethod === "cash")
+            .reduce((sum, payment) => sum + payment.amount, 0),
+          onlineClaimed: riderPayments
+            .filter((payment) => payment.paymentMethod !== "cash")
+            .reduce((sum, payment) => sum + payment.amount, 0),
+          pendingReconciliation: riderPayments
+            .filter((payment) => payment.paymentStatus === "pending_verification")
+            .reduce((sum, payment) => sum + payment.amount, 0),
+          completedDeliveries,
+          missedDeliveries: riderDeliveries.filter(
+            (delivery) => delivery.status === "not_delivered" || delivery.status === "skipped",
+          ).length,
+          deliveredCount: completedDeliveries,
+        };
+      }),
+    activeSubscriptions: subscriptions.filter((subscription) => subscription.status === "active").length,
   };
 }
 
@@ -899,66 +1338,84 @@ export async function getRiderDashboard(user: SessionUser) {
   }
 
   const supabase = await createServerSupabaseClient();
-  const [riderResult, ordersResult, paymentsResult] = await Promise.all([
+  await maybeSyncDeliveryRecords();
+
+  const [riderResult, deliveriesResult, paymentsResult, subscriptions] = await Promise.all([
     supabase.from("riders").select(RIDER_SELECT).eq("id", effectiveRiderId).maybeSingle(),
     supabase
-      .from("orders")
-      .select(ORDER_SELECT)
+      .from("delivery_records")
+      .select(DELIVERY_SELECT)
       .eq("rider_id", effectiveRiderId)
-      .order("delivery_date", { ascending: false }),
+      .eq("scheduled_date", format(new Date(), "yyyy-MM-dd"))
+      .order("scheduled_date", { ascending: true }),
     supabase
       .from("payments")
       .select(PAYMENT_SELECT)
       .eq("rider_id", effectiveRiderId)
       .order("received_at", { ascending: false }),
+    getAllSubscriptions(),
   ]);
 
   if (riderResult.error) {
     throw riderResult.error;
   }
 
-  if (ordersResult.error) {
-    throw ordersResult.error;
+  if (deliveriesResult.error) {
+    throw deliveriesResult.error;
   }
 
   if (paymentsResult.error) {
     throw paymentsResult.error;
   }
 
-  const rider = riderResult.data
-    ? mapRider(riderResult.data as Record<string, unknown>)
-    : undefined;
-  const assignedOrders = (ordersResult.data ?? []).map((row) =>
-    mapOrder(row as Record<string, unknown>),
+  const rider = riderResult.data ? mapRider(riderResult.data as Record<string, unknown>) : undefined;
+  const deliveryRecords = (deliveriesResult.data ?? []).map((row) =>
+    mapDeliveryRecord(row as Record<string, unknown>),
   );
-  const payments = (paymentsResult.data ?? []).map((row) =>
-    mapPayment(row as Record<string, unknown>),
-  );
-  const todaysDeliveries = assignedOrders.filter((order) =>
-    isSameDay(parseISO(order.deliveryDate), todayDate()),
-  );
+  const payments = (paymentsResult.data ?? []).map((row) => mapPayment(row as Record<string, unknown>));
+  const paymentsByDelivery = new Map<string, Payment[]>();
+
+  for (const payment of payments) {
+    if (!payment.deliveryRecordId) {
+      continue;
+    }
+
+    const list = paymentsByDelivery.get(payment.deliveryRecordId) ?? [];
+    list.push(payment);
+    paymentsByDelivery.set(payment.deliveryRecordId, list);
+  }
+
   const customers = await fetchCustomersByIds(
-    Array.from(new Set(todaysDeliveries.map((order) => order.customerId))),
+    Array.from(new Set(deliveryRecords.map((delivery) => delivery.customerId))),
   );
   const customerMap = new Map(customers.map((customer) => [customer.id, customer]));
+  const subscriptionMap = new Map(subscriptions.map((subscription) => [subscription.id, subscription]));
+  const deliveries = deliveryRecords.map((delivery) => ({
+    deliveryRecord: delivery,
+    order: toOrderView(
+      delivery,
+      subscriptionMap.get(delivery.subscriptionId),
+      customerMap.get(delivery.customerId),
+      paymentsByDelivery.get(delivery.id),
+    ),
+    customer: customerMap.get(delivery.customerId),
+  }));
 
   return {
     rider,
-    todayDeliveriesCount: todaysDeliveries.length,
-    pendingDeliveriesCount: todaysDeliveries.filter((order) => order.orderStatus !== "delivered")
-      .length,
+    todayDeliveriesCount: deliveries.length,
+    pendingDeliveriesCount: deliveries.filter(
+      ({ deliveryRecord }) =>
+        deliveryRecord.status !== "delivered" && deliveryRecord.status !== "partially_delivered",
+    ).length,
     cashCollectedToday: payments
       .filter(
         (payment) =>
-          payment.riderId === riderId &&
           payment.paymentMethod === "cash" &&
           isSameDay(parseISO(payment.receivedAt), todayDate()),
       )
       .reduce((sum, payment) => sum + payment.amount, 0),
-    deliveries: todaysDeliveries.map((order) => ({
-      order,
-      customer: customerMap.get(order.customerId),
-    })),
+    deliveries,
   };
 }
 
@@ -975,32 +1432,63 @@ export async function getRiderDeliveries(user: SessionUser) {
   }
 
   const supabase = await createServerSupabaseClient();
-  const { data, error } = await supabase
-    .from("orders")
-    .select(ORDER_SELECT)
-    .eq("rider_id", effectiveRiderId)
-    .order("delivery_date", { ascending: true });
+  await maybeSyncDeliveryRecords();
+  const [deliveriesResult, subscriptions, payments] = await Promise.all([
+    supabase
+      .from("delivery_records")
+      .select(DELIVERY_SELECT)
+      .eq("rider_id", effectiveRiderId)
+      .order("scheduled_date", { ascending: true }),
+    getAllSubscriptions(),
+    getAllPayments(),
+  ]);
 
-  if (error) {
-    throw error;
+  if (deliveriesResult.error) {
+    throw deliveriesResult.error;
   }
 
-  const orders = (data ?? []).map((row) => mapOrder(row as Record<string, unknown>));
+  const deliveryRecords = (deliveriesResult.data ?? []).map((row) =>
+    mapDeliveryRecord(row as Record<string, unknown>),
+  );
   const customers = await fetchCustomersByIds(
-    Array.from(new Set(orders.map((order) => order.customerId))),
+    Array.from(new Set(deliveryRecords.map((delivery) => delivery.customerId))),
   );
   const customerMap = new Map(customers.map((customer) => [customer.id, customer]));
-  const items = orders
-    .map((order) => ({
-      order,
-      customer: customerMap.get(order.customerId),
-    }));
+  const subscriptionMap = new Map(subscriptions.map((subscription) => [subscription.id, subscription]));
+  const paymentsByDelivery = new Map<string, Payment[]>();
+
+  for (const payment of payments) {
+    if (!payment.deliveryRecordId) {
+      continue;
+    }
+
+    const list = paymentsByDelivery.get(payment.deliveryRecordId) ?? [];
+    list.push(payment);
+    paymentsByDelivery.set(payment.deliveryRecordId, list);
+  }
+
+  const items = deliveryRecords.map((delivery) => ({
+    deliveryRecord: delivery,
+    order: toOrderView(
+      delivery,
+      subscriptionMap.get(delivery.subscriptionId),
+      customerMap.get(delivery.customerId),
+      paymentsByDelivery.get(delivery.id),
+    ),
+    customer: customerMap.get(delivery.customerId),
+  }));
 
   return {
     items,
     totalCount: items.length,
-    pendingCount: items.filter(({ order }) => order.orderStatus !== "delivered").length,
-    deliveredCount: items.filter(({ order }) => order.orderStatus === "delivered").length,
+    pendingCount: items.filter(
+      ({ deliveryRecord }) =>
+        deliveryRecord.status !== "delivered" && deliveryRecord.status !== "partially_delivered",
+    ).length,
+    deliveredCount: items.filter(
+      ({ deliveryRecord }) =>
+        deliveryRecord.status === "delivered" || deliveryRecord.status === "partially_delivered",
+    ).length,
   };
 }
 
@@ -1027,30 +1515,43 @@ export async function getRiderCollections(user: SessionUser) {
     throw error;
   }
 
-  const riderPayments = (data ?? []).map((row) =>
-    mapPayment(row as Record<string, unknown>),
-  );
-  const [customers, orders] = await Promise.all([
+  const riderPayments = (data ?? []).map((row) => mapPayment(row as Record<string, unknown>));
+  const [customers, deliveries, subscriptions] = await Promise.all([
     fetchCustomersByIds(Array.from(new Set(riderPayments.map((payment) => payment.customerId)))),
-    fetchOrdersByIds(
+    fetchDeliveryRecordsByIds(
       Array.from(
         new Set(
           riderPayments
-            .map((payment) => payment.orderId)
-            .filter((orderId): orderId is string => Boolean(orderId)),
+            .map((payment) => payment.deliveryRecordId)
+            .filter((deliveryRecordId): deliveryRecordId is string => Boolean(deliveryRecordId)),
         ),
       ),
     ),
+    getAllSubscriptions(),
   ]);
   const customerMap = new Map(customers.map((customer) => [customer.id, customer]));
-  const orderMap = new Map(orders.map((order) => [order.id, order]));
+  const deliveryMap = new Map(deliveries.map((delivery) => [delivery.id, delivery]));
+  const subscriptionMap = new Map(subscriptions.map((subscription) => [subscription.id, subscription]));
 
   return {
-    items: riderPayments.map((payment) => ({
-      payment,
-      customer: customerMap.get(payment.customerId),
-      order: payment.orderId ? orderMap.get(payment.orderId) : undefined,
-    })),
+    items: riderPayments.map((payment) => {
+      const customer = customerMap.get(payment.customerId);
+      const delivery = payment.deliveryRecordId ? deliveryMap.get(payment.deliveryRecordId) : undefined;
+
+      return {
+        payment,
+        customer,
+        order:
+          delivery && customer
+            ? toOrderView(
+                delivery,
+                subscriptionMap.get(delivery.subscriptionId),
+                customer,
+                [payment],
+              )
+            : undefined,
+      };
+    }),
     cashCollectedToday: riderPayments
       .filter(
         (payment) =>

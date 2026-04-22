@@ -21,7 +21,7 @@ export default async function EditCustomerPage({ params }: EditCustomerProps) {
       <PageHeader
         eyebrow="Customers"
         title={`Edit ${detail.customer.name}`}
-        description="Adjust service month, rider assignment, and activation without breaking historical delivery records."
+        description="Update customer contact details and status without affecting delivery history."
       />
       <CustomerForm customer={detail.customer} riders={riders} />
     </div>

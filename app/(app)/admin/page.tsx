@@ -21,9 +21,9 @@ export default async function AdminDashboardPage() {
         description="Track dispatches, cash collection, pending dues, and rider accountability in one place."
         actions={
           <>
-            <Link href="/admin/orders/new" className={cn(buttonVariants({ size: "lg" }), "h-12 rounded-2xl")}>
+            <Link href="/admin/subscriptions/new" className={cn(buttonVariants({ size: "lg" }), "h-12 rounded-2xl")}>
               <Plus className="size-4" />
-              New Order
+              New Subscription
             </Link>
             <Link href="/admin/customers/new" className={cn(buttonVariants({ variant: "outline", size: "lg" }), "h-12 rounded-2xl")}>
               Add Customer
@@ -34,15 +34,15 @@ export default async function AdminDashboardPage() {
 
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
         <MetricCard
-          title="Today's orders"
+          title="Today's deliveries"
           value={String(dashboard.todayOrdersCount)}
-          hint="All deliveries planned for today"
+          hint="Scheduled stops for today"
           icon={Package}
         />
         <MetricCard
-          title="Delivered"
+          title="Completed"
           value={String(dashboard.deliveredOrdersCount)}
-          hint="Completed delivery updates"
+          hint="Delivered or partially delivered"
           icon={Truck}
         />
         <MetricCard
@@ -72,8 +72,8 @@ export default async function AdminDashboardPage() {
             <CardDescription>Fast shortcuts for the owner&apos;s daily workflow.</CardDescription>
           </CardHeader>
           <CardContent className="grid gap-3 sm:grid-cols-2">
-            <Link href="/admin/orders/new" className={cn(buttonVariants({ size: "lg" }), "h-14 justify-start rounded-2xl")}>
-              Create order
+            <Link href="/admin/subscriptions/new" className={cn(buttonVariants({ size: "lg" }), "h-14 justify-start rounded-2xl")}>
+              Create subscription
             </Link>
             <Link href="/admin/customers/new" className={cn(buttonVariants({ variant: "outline", size: "lg" }), "h-14 justify-start rounded-2xl")}>
               Add customer
@@ -105,7 +105,9 @@ export default async function AdminDashboardPage() {
               <p className="text-sm text-muted-foreground">On route</p>
               <p className="mt-2 text-2xl font-semibold">
                 {
-                  dashboard.recentOrders.filter((order) => order.orderStatus === "assigned")
+                  dashboard.recentOrders.filter(
+                    (order) => order.orderStatus === "assigned" || order.orderStatus === "today",
+                  )
                     .length
                 }
               </p>
@@ -117,8 +119,8 @@ export default async function AdminDashboardPage() {
       <div className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
         <Card>
           <CardHeader>
-            <CardTitle>Recent orders</CardTitle>
-            <CardDescription>Latest dispatches and payment expectations.</CardDescription>
+            <CardTitle>Recent deliveries</CardTitle>
+            <CardDescription>Latest scheduled deliveries and payment expectations.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
             {dashboard.recentOrders.map((order) => (
@@ -176,7 +178,7 @@ export default async function AdminDashboardPage() {
                     <div>
                       <p className="font-medium text-foreground">{summary.riderName}</p>
                       <p className="text-sm text-muted-foreground">
-                        {summary.deliveredCount} delivered orders
+                        {summary.deliveredCount} completed deliveries
                       </p>
                     </div>
                     <div className="text-right text-sm">

@@ -19,11 +19,15 @@ export default async function DeliveryCompletePage({ params }: DeliveryCompleteP
   return (
     <div className="space-y-6">
       <PageHeader
-        eyebrow="Mark delivered"
+        eyebrow="Update delivery"
         title={`Complete ${detail.order.orderNumber}`}
-        description="Delivery cannot be closed until a payment outcome is selected."
+        description="A delivery record cannot be closed until its status and payment outcome are captured."
       />
-      <DeliveryCompletionForm order={detail.order} customer={detail.customer} />
+      <DeliveryCompletionForm
+        deliveryRecord={detail.deliveryRecord}
+        subscription={detail.subscription}
+        customer={detail.customer}
+      />
     </div>
   );
 }

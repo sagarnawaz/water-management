@@ -30,7 +30,7 @@ export default async function DeliverySuccessPage({
       <PageHeader
         eyebrow="Success"
         title="Delivery submitted"
-        description="The order, payment outcome, and ledger flow have been recorded."
+        description="The delivery status, payment outcome, and ledger flow have been recorded."
       />
 
       <Card className="border-emerald-200 bg-emerald-50/70">
@@ -39,7 +39,7 @@ export default async function DeliverySuccessPage({
             <CheckCircle2 className="size-7" />
             <div>
               <p className="text-lg font-semibold">Recorded payment summary</p>
-              <p className="text-sm">Order {orderId}</p>
+              <p className="text-sm">Delivery {orderId}</p>
             </div>
           </div>
           <div className="grid gap-3 sm:grid-cols-3">

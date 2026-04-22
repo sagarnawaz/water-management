@@ -6,8 +6,8 @@ import { PageHeader } from "@/components/layout/page-header";
 import { StatusBadge } from "@/components/status-badge";
 import { buttonVariants } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { cn } from "@/lib/utils";
 import { formatCurrency, formatDateTime } from "@/lib/format";
+import { cn } from "@/lib/utils";
 import { getOrder } from "@/services/data";
 
 type RiderDeliveryDetailProps = {
@@ -43,9 +43,12 @@ export default async function RiderDeliveryDetailPage({
           </div>
           <div className="grid gap-3 text-sm text-muted-foreground sm:grid-cols-2">
             <p>Quantity: {detail.order.bottleQty}</p>
-            <p>Total amount: {formatCurrency(detail.order.totalAmount)}</p>
-            <p>Delivery date: {formatDateTime(detail.order.deliveryDate)}</p>
+            <p>Expected amount: {formatCurrency(detail.order.totalAmount)}</p>
+            <p>Scheduled date: {formatDateTime(detail.order.deliveryDate)}</p>
             <p>Expected payment: {detail.order.expectedPaymentMethod.replaceAll("_", " ")}</p>
+            {detail.subscription ? (
+              <p>Plan: {detail.subscription.deliveryFrequency.replaceAll("_", " ")}</p>
+            ) : null}
             <p className="sm:col-span-2">Notes: {detail.order.notes || "No notes"}</p>
           </div>
           <div className="grid gap-2 sm:grid-cols-3">
@@ -58,7 +61,7 @@ export default async function RiderDeliveryDetailPage({
               Open location
             </a>
             <Link href={`/rider/deliveries/${detail.order.id}/complete`} className={cn(buttonVariants({ size: "lg" }), "h-12 rounded-2xl justify-center")}>
-              Mark delivered
+              Update delivery
             </Link>
           </div>
         </CardContent>
