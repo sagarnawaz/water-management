@@ -8,14 +8,10 @@ import { buttonVariants } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import { formatCurrency, formatDate } from "@/lib/format";
-import { getAdminDashboardData, listCustomers, listRiders } from "@/services/data";
+import { getAdminDashboardData } from "@/services/data";
 
 export default async function AdminDashboardPage() {
-  const [dashboard, customers, riders] = await Promise.all([
-    getAdminDashboardData(),
-    listCustomers(),
-    listRiders(),
-  ]);
+  const dashboard = await getAdminDashboardData();
 
   return (
     <div className="space-y-6">
@@ -99,11 +95,11 @@ export default async function AdminDashboardPage() {
           <CardContent className="grid gap-4 sm:grid-cols-3">
             <div className="rounded-3xl bg-muted/60 p-4">
               <p className="text-sm text-muted-foreground">Customers</p>
-              <p className="mt-2 text-2xl font-semibold">{customers.length}</p>
+              <p className="mt-2 text-2xl font-semibold">{dashboard.customerCount}</p>
             </div>
             <div className="rounded-3xl bg-muted/60 p-4">
               <p className="text-sm text-muted-foreground">Riders</p>
-              <p className="mt-2 text-2xl font-semibold">{riders.length}</p>
+              <p className="mt-2 text-2xl font-semibold">{dashboard.riderCount}</p>
             </div>
             <div className="rounded-3xl bg-muted/60 p-4">
               <p className="text-sm text-muted-foreground">On route</p>
@@ -130,9 +126,7 @@ export default async function AdminDashboardPage() {
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>
                     <p className="font-medium text-foreground">{order.orderNumber}</p>
-                    <p className="text-sm text-muted-foreground">
-                      {customers.find((customer) => customer.id === order.customerId)?.name}
-                    </p>
+                    <p className="text-sm text-muted-foreground">{order.customerName}</p>
                     <p className="text-sm text-muted-foreground">{formatDate(order.deliveryDate)}</p>
                   </div>
                   <div className="space-y-2 text-right">

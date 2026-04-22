@@ -10,11 +10,17 @@ import {
   Users,
 } from "lucide-react";
 
-import type { PaymentMethod, UserRole } from "@/types/domain";
+import type { BusinessProfile, PaymentMethod, UserRole } from "@/types/domain";
 
 export const APP_NAME = "AquaRoute Ops";
 
-export const DEMO_PASSWORD = "water123";
+export const BUSINESS_PROFILE: BusinessProfile = {
+  businessName: "AquaRoute Water Supply",
+  ownerName: "Hassan Malik",
+  phone: "+92 300 1234567",
+  address: "Main Tanki Road, Gulshan-e-Noor, Karachi",
+  serviceAreas: ["Gulshan", "North Nazimabad", "Buffer Zone", "Johar"],
+};
 
 export const paymentMethodOptions: Array<{
   value: PaymentMethod;

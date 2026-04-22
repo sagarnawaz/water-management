@@ -5,7 +5,6 @@ import { format, isSameDay, parseISO, startOfDay, startOfMonth, startOfWeek } fr
 
 import { getServiceSummary } from "@/lib/customer-service";
 import { createServerSupabaseClient } from "@/lib/supabase/server";
-import { hasSupabaseEnv } from "@/lib/supabase/config";
 import { syncCustomerSubscriptionOrders } from "@/services/subscription-sync";
 import type {
   Customer,
@@ -19,28 +18,87 @@ import type {
   Rider,
   SessionUser,
 } from "@/types/domain";
-import {
-  businessProfile as mockBusinessProfile,
-  customers as mockCustomers,
-  getAdminDashboardData as getMockAdminDashboardData,
-  getAreas as getMockAreas,
-  getCustomer as getMockCustomer,
-  getOrder as getMockOrder,
-  getPaymentHistory as getMockPaymentHistory,
-  getPendingPayments as getMockPendingPayments,
-  getReportSummary as getMockReportSummary,
-  getRider as getMockRider,
-  getRiderDashboard as getMockRiderDashboard,
-  ledgerEntries as mockLedgerEntries,
-  listCustomers as listMockCustomers,
-  listOrders as listMockOrders,
-  listRiders as listMockRiders,
-  orders as mockOrders,
-  payments as mockPayments,
-  riders as mockRiders,
-} from "@/services/mock-data";
 
 const todayDate = () => startOfDay(new Date());
+const CUSTOMER_SELECT = [
+  "id",
+  "name",
+  "phone",
+  "alternate_phone",
+  "address",
+  "area",
+  "notes",
+  "daily_bottle_qty",
+  "price_per_bottle",
+  "default_payment_method",
+  "assigned_rider_id",
+  "billing_month",
+  "service_start_date",
+  "service_end_date",
+  "is_active",
+  "created_at",
+].join(", ");
+const RIDER_SELECT = [
+  "id",
+  "auth_user_id",
+  "name",
+  "phone",
+  "vehicle_number",
+  "status",
+  "created_at",
+].join(", ");
+const ORDER_SELECT = [
+  "id",
+  "customer_id",
+  "rider_id",
+  "bottle_qty",
+  "delivered_qty",
+  "price_per_bottle",
+  "total_amount",
+  "amount_received",
+  "due_amount",
+  "delivery_date",
+  "notes",
+  "order_status",
+  "expected_payment_method",
+  "payment_status",
+  "created_by",
+  "created_at",
+  "updated_at",
+  "service_day",
+  "is_subscription_order",
+  "transaction_reference",
+].join(", ");
+const PAYMENT_SELECT = [
+  "id",
+  "order_id",
+  "customer_id",
+  "rider_id",
+  "amount",
+  "payment_method",
+  "payment_status",
+  "transaction_reference",
+  "proof_url",
+  "verified_by",
+  "verified_at",
+  "received_at",
+  "notes",
+].join(", ");
+const LEDGER_SELECT = [
+  "id",
+  "customer_id",
+  "order_id",
+  "payment_id",
+  "entry_type",
+  "debit",
+  "credit",
+  "balance_snapshot",
+  "description",
+  "created_at",
+].join(", ");
+const SUBSCRIPTION_SYNC_WINDOW_MS = 5 * 60 * 1000;
+let lastSubscriptionSyncAt = 0;
+let subscriptionSyncPromise: Promise<void> | null = null;
 
 function buildOrderNumber(id: string) {
   return `ORD-${id.replaceAll("-", "").slice(0, 6).toUpperCase()}`;
@@ -78,9 +136,7 @@ function mapCustomer(row: Record<string, unknown>): Customer {
     notes: row.notes ? String(row.notes) : undefined,
     dailyBottleQty: toNumber(row.daily_bottle_qty) || 1,
     pricePerBottle: toNumber(row.price_per_bottle) || 180,
-    paymentMethod: String(
-      row.default_payment_method ?? "cash",
-    ) as PaymentMethod,
+    paymentMethod: String(row.default_payment_method ?? "cash") as PaymentMethod,
     assignedRiderId: row.assigned_rider_id ? String(row.assigned_rider_id) : undefined,
     billingMonth: String(row.billing_month ?? format(new Date(), "yyyy-MM-01")),
     serviceStartDate: String(row.service_start_date ?? format(new Date(), "yyyy-MM-dd")),
@@ -102,19 +158,17 @@ function mapRider(row: Record<string, unknown>): Rider {
   };
 }
 
-function mapOrder(
-  row: Record<string, unknown>,
-  customer?: Customer,
-): Order {
+function mapOrder(row: Record<string, unknown>, customer?: Customer): Order {
   return {
     id: String(row.id),
     orderNumber: buildOrderNumber(String(row.id)),
     customerId: String(row.customer_id ?? ""),
     riderId: row.rider_id ? String(row.rider_id) : undefined,
     bottleQty: toNumber(row.bottle_qty),
-    deliveredQty: row.delivered_qty === null || row.delivered_qty === undefined
-      ? undefined
-      : toNumber(row.delivered_qty),
+    deliveredQty:
+      row.delivered_qty === null || row.delivered_qty === undefined
+        ? undefined
+        : toNumber(row.delivered_qty),
     pricePerBottle: toNumber(row.price_per_bottle),
     totalAmount: toNumber(row.total_amount),
     amountReceived: toNumber(row.amount_received),
@@ -122,9 +176,7 @@ function mapOrder(
     deliveryDate: String(row.delivery_date ?? new Date().toISOString()),
     notes: row.notes ? String(row.notes) : undefined,
     orderStatus: String(row.order_status ?? "assigned") as OrderStatus,
-    expectedPaymentMethod: String(
-      row.expected_payment_method ?? "cash",
-    ) as PaymentMethod,
+    expectedPaymentMethod: String(row.expected_payment_method ?? "cash") as PaymentMethod,
     paymentStatus: String(row.payment_status ?? "unpaid") as OrderPaymentStatus,
     createdBy: row.created_by ? String(row.created_by) : "",
     createdAt: String(row.created_at ?? new Date().toISOString()),
@@ -146,9 +198,7 @@ function mapPayment(row: Record<string, unknown>): Payment {
     riderId: row.rider_id ? String(row.rider_id) : undefined,
     amount: toNumber(row.amount),
     paymentMethod: String(row.payment_method ?? "cash") as PaymentMethod,
-    paymentStatus: String(
-      row.payment_status ?? "received",
-    ) as PaymentRecordStatus,
+    paymentStatus: String(row.payment_status ?? "received") as PaymentRecordStatus,
     transactionReference: row.transaction_reference
       ? String(row.transaction_reference)
       : undefined,
@@ -201,9 +251,7 @@ function filterOrdersByStatus(orders: Order[], filter = "all") {
   }
 
   if (filter === "today") {
-    return orders.filter((order) =>
-      isSameDay(parseISO(order.deliveryDate), todayDate()),
-    );
+    return orders.filter((order) => isSameDay(parseISO(order.deliveryDate), todayDate()));
   }
 
   if (filter === "pending_payment") {
@@ -219,15 +267,66 @@ function filterOrdersByStatus(orders: Order[], filter = "all") {
   return orders.filter((order) => order.orderStatus === filter);
 }
 
-const getAllCustomers = cache(async () => {
-  if (!hasSupabaseEnv()) {
-    return mockCustomers;
+async function fetchCustomersByIds(ids: string[]) {
+  if (ids.length === 0) {
+    return [];
   }
 
   const supabase = await createServerSupabaseClient();
   const { data, error } = await supabase
     .from("customers")
-    .select("*")
+    .select(CUSTOMER_SELECT)
+    .in("id", ids);
+
+  if (error) {
+    throw error;
+  }
+
+  return (data ?? []).map((row) => mapCustomer(row as Record<string, unknown>));
+}
+
+async function fetchOrdersByIds(ids: string[]) {
+  if (ids.length === 0) {
+    return [];
+  }
+
+  const supabase = await createServerSupabaseClient();
+  const { data, error } = await supabase
+    .from("orders")
+    .select(ORDER_SELECT)
+    .in("id", ids);
+
+  if (error) {
+    throw error;
+  }
+
+  return (data ?? []).map((row) => mapOrder(row as Record<string, unknown>));
+}
+
+async function maybeSyncSubscriptionOrders() {
+  const now = Date.now();
+
+  if (now - lastSubscriptionSyncAt < SUBSCRIPTION_SYNC_WINDOW_MS) {
+    return;
+  }
+
+  if (!subscriptionSyncPromise) {
+    subscriptionSyncPromise = (async () => {
+      await syncCustomerSubscriptionOrders();
+      lastSubscriptionSyncAt = Date.now();
+    })().finally(() => {
+      subscriptionSyncPromise = null;
+    });
+  }
+
+  await subscriptionSyncPromise;
+}
+
+const getAllCustomers = cache(async () => {
+  const supabase = await createServerSupabaseClient();
+  const { data, error } = await supabase
+    .from("customers")
+    .select(CUSTOMER_SELECT)
     .order("created_at", { ascending: false });
 
   if (error) {
@@ -238,14 +337,10 @@ const getAllCustomers = cache(async () => {
 });
 
 const getAllRiders = cache(async () => {
-  if (!hasSupabaseEnv()) {
-    return mockRiders;
-  }
-
   const supabase = await createServerSupabaseClient();
   const { data, error } = await supabase
     .from("riders")
-    .select("*")
+    .select(RIDER_SELECT)
     .order("created_at", { ascending: false });
 
   if (error) {
@@ -256,17 +351,16 @@ const getAllRiders = cache(async () => {
 });
 
 const getAllOrders = cache(async () => {
-  if (!hasSupabaseEnv()) {
-    return mockOrders;
-  }
+  await maybeSyncSubscriptionOrders();
 
-  await syncCustomerSubscriptionOrders();
-  const [customerList] = await Promise.all([getAllCustomers()]);
+  const [customerList, supabase] = await Promise.all([
+    getAllCustomers(),
+    createServerSupabaseClient(),
+  ]);
   const customerMap = new Map(customerList.map((customer) => [customer.id, customer]));
-  const supabase = await createServerSupabaseClient();
   const { data, error } = await supabase
     .from("orders")
-    .select("*")
+    .select(ORDER_SELECT)
     .order("delivery_date", { ascending: false });
 
   if (error) {
@@ -282,14 +376,10 @@ const getAllOrders = cache(async () => {
 });
 
 const getAllPayments = cache(async () => {
-  if (!hasSupabaseEnv()) {
-    return mockPayments;
-  }
-
   const supabase = await createServerSupabaseClient();
   const { data, error } = await supabase
     .from("payments")
-    .select("*")
+    .select(PAYMENT_SELECT)
     .order("received_at", { ascending: false });
 
   if (error) {
@@ -299,37 +389,26 @@ const getAllPayments = cache(async () => {
   return (data ?? []).map((row) => mapPayment(row as Record<string, unknown>));
 });
 
-const getAllLedgerEntries = cache(async () => {
-  if (!hasSupabaseEnv()) {
-    return computeRunningLedger(mockLedgerEntries);
+async function resolveEffectiveRiderId(user: SessionUser) {
+  if (user.riderId) {
+    return user.riderId;
   }
 
   const supabase = await createServerSupabaseClient();
   const { data, error } = await supabase
-    .from("ledger_entries")
-    .select("*")
-    .order("created_at", { ascending: true });
+    .from("riders")
+    .select("id")
+    .eq("auth_user_id", user.id)
+    .maybeSingle();
 
   if (error) {
     throw error;
   }
 
-  return computeRunningLedger(
-    (data ?? []).map((row) => mapLedger(row as Record<string, unknown>)),
-  );
-});
-
-export const businessProfile = mockBusinessProfile;
-
-function resolveRiderId(user: SessionUser, riders: Rider[]) {
-  return user.riderId ?? riders.find((rider) => rider.authUserId === user.id)?.id;
+  return data?.id ? String(data.id) : null;
 }
 
 export async function listCustomers(query?: string) {
-  if (!hasSupabaseEnv()) {
-    return listMockCustomers(query);
-  }
-
   const customers = await getAllCustomers();
 
   if (!query) {
@@ -345,56 +424,97 @@ export async function listCustomers(query?: string) {
   );
 }
 
-export async function listRiders() {
-  if (!hasSupabaseEnv()) {
-    return listMockRiders();
+export async function listCustomerSummaries(query?: string) {
+  const [customers, orders, payments] = await Promise.all([
+    listCustomers(query),
+    getAllOrders(),
+    getAllPayments(),
+  ]);
+
+  const totalsByCustomer = new Map<string, { totalOrders: number; totalPaid: number }>();
+
+  for (const order of orders) {
+    const totals = totalsByCustomer.get(order.customerId) ?? { totalOrders: 0, totalPaid: 0 };
+    totals.totalOrders += order.totalAmount;
+    totalsByCustomer.set(order.customerId, totals);
   }
 
+  for (const payment of payments) {
+    const totals = totalsByCustomer.get(payment.customerId) ?? { totalOrders: 0, totalPaid: 0 };
+    totals.totalPaid += payment.amount;
+    totalsByCustomer.set(payment.customerId, totals);
+  }
+
+  return customers.map((customer) => {
+    const totals = totalsByCustomer.get(customer.id) ?? { totalOrders: 0, totalPaid: 0 };
+
+    return {
+      customer,
+      totals: {
+        totalOrders: totals.totalOrders,
+        totalPaid: totals.totalPaid,
+        currentDue: Math.max(totals.totalOrders - totals.totalPaid, 0),
+      },
+    };
+  });
+}
+
+export async function listRiders() {
   return getAllRiders();
 }
 
 export async function listOrders(filter = "all") {
-  if (!hasSupabaseEnv()) {
-    return listMockOrders(filter);
-  }
-
   const orders = await getAllOrders();
   return filterOrdersByStatus(orders, filter);
 }
 
 export async function getCustomer(id: string) {
-  if (!hasSupabaseEnv()) {
-    const detail = getMockCustomer(id);
-    if (!detail) {
-      return null;
-    }
-
-    return {
-      ...detail,
-      serviceSummary: getServiceSummary({
-        billingMonth: detail.customer.billingMonth,
-        serviceStartDate: detail.customer.serviceStartDate,
-        dailyBottleQty: detail.customer.dailyBottleQty,
-        pricePerBottle: detail.customer.pricePerBottle,
-      }),
-    };
-  }
-
-  const [customers, orders, payments, ledger] = await Promise.all([
-    getAllCustomers(),
-    getAllOrders(),
-    getAllPayments(),
-    getAllLedgerEntries(),
+  const supabase = await createServerSupabaseClient();
+  const [
+    customerResult,
+    ordersResult,
+    paymentsResult,
+    ledgerResult,
+  ] = await Promise.all([
+    supabase.from("customers").select(CUSTOMER_SELECT).eq("id", id).maybeSingle(),
+    supabase.from("orders").select(ORDER_SELECT).eq("customer_id", id).order("delivery_date", { ascending: false }),
+    supabase.from("payments").select(PAYMENT_SELECT).eq("customer_id", id).order("received_at", { ascending: false }),
+    supabase.from("ledger_entries").select(LEDGER_SELECT).eq("customer_id", id).order("created_at", { ascending: true }),
   ]);
 
-  const customer = customers.find((entry) => entry.id === id);
+  if (customerResult.error) {
+    throw customerResult.error;
+  }
+
+  const customer = customerResult.data
+    ? mapCustomer(customerResult.data as Record<string, unknown>)
+    : null;
+
   if (!customer) {
     return null;
   }
 
-  const customerOrders = orders.filter((order) => order.customerId === id);
-  const customerPayments = payments.filter((payment) => payment.customerId === id);
-  const customerLedger = ledger.filter((entry) => entry.customerId === id);
+  if (ordersResult.error) {
+    throw ordersResult.error;
+  }
+
+  if (paymentsResult.error) {
+    throw paymentsResult.error;
+  }
+
+  if (ledgerResult.error) {
+    throw ledgerResult.error;
+  }
+
+  const customerOrders = (ordersResult.data ?? []).map((row) =>
+    mapOrder(row as Record<string, unknown>, customer),
+  );
+  const customerPayments = (paymentsResult.data ?? []).map((row) =>
+    mapPayment(row as Record<string, unknown>),
+  );
+  const customerLedger = computeRunningLedger(
+    (ledgerResult.data ?? []).map((row) => mapLedger(row as Record<string, unknown>)),
+  );
 
   const totalOrders = customerOrders.reduce((sum, order) => sum + order.totalAmount, 0);
   const totalPaid = customerPayments.reduce((sum, payment) => sum + payment.amount, 0);
@@ -419,23 +539,39 @@ export async function getCustomer(id: string) {
 }
 
 export async function getRider(id: string) {
-  if (!hasSupabaseEnv()) {
-    return getMockRider(id);
-  }
-
-  const [riders, orders, payments] = await Promise.all([
-    getAllRiders(),
-    getAllOrders(),
-    getAllPayments(),
+  const supabase = await createServerSupabaseClient();
+  const [riderResult, ordersResult, paymentsResult] = await Promise.all([
+    supabase.from("riders").select(RIDER_SELECT).eq("id", id).maybeSingle(),
+    supabase.from("orders").select(ORDER_SELECT).eq("rider_id", id).order("delivery_date", { ascending: false }),
+    supabase.from("payments").select(PAYMENT_SELECT).eq("rider_id", id).order("received_at", { ascending: false }),
   ]);
 
-  const rider = riders.find((entry) => entry.id === id);
+  if (riderResult.error) {
+    throw riderResult.error;
+  }
+
+  const rider = riderResult.data
+    ? mapRider(riderResult.data as Record<string, unknown>)
+    : null;
+
   if (!rider) {
     return null;
   }
 
-  const riderOrders = orders.filter((order) => order.riderId === id);
-  const riderPayments = payments.filter((payment) => payment.riderId === id);
+  if (ordersResult.error) {
+    throw ordersResult.error;
+  }
+
+  if (paymentsResult.error) {
+    throw paymentsResult.error;
+  }
+
+  const riderOrders = (ordersResult.data ?? []).map((row) =>
+    mapOrder(row as Record<string, unknown>),
+  );
+  const riderPayments = (paymentsResult.data ?? []).map((row) =>
+    mapPayment(row as Record<string, unknown>),
+  );
   const deliveredOrders = riderOrders.filter((order) => order.orderStatus === "delivered");
 
   return {
@@ -458,37 +594,78 @@ export async function getRider(id: string) {
 }
 
 export async function getOrder(id: string) {
-  if (!hasSupabaseEnv()) {
-    return getMockOrder(id);
+  const supabase = await createServerSupabaseClient();
+  const orderResult = await supabase.from("orders").select(ORDER_SELECT).eq("id", id).maybeSingle();
+
+  if (orderResult.error) {
+    throw orderResult.error;
   }
 
-  const [orders, customers, riders, payments, ledger] = await Promise.all([
-    getAllOrders(),
-    getAllCustomers(),
-    getAllRiders(),
-    getAllPayments(),
-    getAllLedgerEntries(),
+  const orderRow = orderResult.data as Record<string, unknown> | null;
+
+  if (!orderRow) {
+    return null;
+  }
+
+  const customerId = String(orderRow.customer_id ?? "");
+  const riderId = orderRow.rider_id ? String(orderRow.rider_id) : null;
+  const [customerResult, riderResult, paymentsResult, ledgerResult] = await Promise.all([
+    customerId
+      ? supabase.from("customers").select(CUSTOMER_SELECT).eq("id", customerId).maybeSingle()
+      : Promise.resolve({ data: null, error: null }),
+    riderId
+      ? supabase.from("riders").select(RIDER_SELECT).eq("id", riderId).maybeSingle()
+      : Promise.resolve({ data: null, error: null }),
+    supabase.from("payments").select(PAYMENT_SELECT).eq("order_id", id).order("received_at", { ascending: false }),
+    supabase.from("ledger_entries").select(LEDGER_SELECT).eq("order_id", id).order("created_at", { ascending: true }),
   ]);
 
-  const order = orders.find((entry) => entry.id === id);
+  if (customerResult.error) {
+    throw customerResult.error;
+  }
+
+  if (riderResult.error) {
+    throw riderResult.error;
+  }
+
+  if (paymentsResult.error) {
+    throw paymentsResult.error;
+  }
+
+  if (ledgerResult.error) {
+    throw ledgerResult.error;
+  }
+
+  const customer = customerResult.data
+    ? mapCustomer(customerResult.data as Record<string, unknown>)
+    : undefined;
+  const order = mapOrder(orderRow, customer);
+
+  const rider = riderResult.data
+    ? mapRider(riderResult.data as Record<string, unknown>)
+    : undefined;
+
+  const payments = (paymentsResult.data ?? []).map((row) =>
+    mapPayment(row as Record<string, unknown>),
+  );
+  const ledger = computeRunningLedger(
+    (ledgerResult.data ?? []).map((row) => mapLedger(row as Record<string, unknown>)),
+  );
+
   if (!order) {
     return null;
   }
 
   return {
     order,
-    customer: customers.find((customer) => customer.id === order.customerId),
-    rider: riders.find((rider) => rider.id === order.riderId),
-    payments: payments.filter((payment) => payment.orderId === id),
-    ledger: ledger.filter((entry) => entry.orderId === id),
+    customer,
+    rider,
+    payments,
+    ledger,
   };
 }
 
 export async function getAdminDashboardData() {
-  if (!hasSupabaseEnv()) {
-    return getMockAdminDashboardData();
-  }
-
   const [customers, riders, orders, payments] = await Promise.all([
     getAllCustomers(),
     getAllRiders(),
@@ -510,8 +687,11 @@ export async function getAdminDashboardData() {
         isSameDay(parseISO(payment.receivedAt), todayDate()),
     )
     .reduce((sum, payment) => sum + payment.amount, 0);
+  const customerMap = new Map(customers.map((customer) => [customer.id, customer]));
 
   return {
+    customerCount: customers.length,
+    riderCount: riders.length,
     todayOrdersCount: todayOrders.length,
     deliveredOrdersCount: deliveredToday.length,
     pendingPaymentsCount: pendingVerification.length,
@@ -519,13 +699,16 @@ export async function getAdminDashboardData() {
     cashCollectedToday,
     recentOrders: [...orders]
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-      .slice(0, 4),
+      .slice(0, 4)
+      .map((order) => ({
+        ...order,
+        customerName: customerMap.get(order.customerId)?.name ?? "Customer",
+      })),
     pendingDues: customers
       .map((customer) => {
         const customerOrders = orders.filter((order) => order.customerId === customer.id);
-        const customerPayments = payments.filter(
-          (payment) => payment.customerId === customer.id,
-        );
+        const customerPayments = payments.filter((payment) => payment.customerId === customer.id);
+
         return {
           customer,
           dueAmount: Math.max(
@@ -554,18 +737,13 @@ export async function getAdminDashboardData() {
         pendingReconciliation: riderPayments
           .filter((payment) => payment.paymentStatus === "pending_verification")
           .reduce((sum, payment) => sum + payment.amount, 0),
-        deliveredCount: riderOrders.filter((order) => order.orderStatus === "delivered")
-          .length,
+        deliveredCount: riderOrders.filter((order) => order.orderStatus === "delivered").length,
       };
     }),
   };
 }
 
 export async function getPendingPayments() {
-  if (!hasSupabaseEnv()) {
-    return getMockPendingPayments();
-  }
-
   const [payments, customers, riders, orders] = await Promise.all([
     getAllPayments(),
     getAllCustomers(),
@@ -584,10 +762,6 @@ export async function getPendingPayments() {
 }
 
 export async function getPaymentHistory() {
-  if (!hasSupabaseEnv()) {
-    return getMockPaymentHistory();
-  }
-
   const [payments, customers, riders, orders] = await Promise.all([
     getAllPayments(),
     getAllCustomers(),
@@ -611,10 +785,6 @@ export async function getReportSummary(
     paymentMethod?: string;
   },
 ) {
-  if (!hasSupabaseEnv()) {
-    return getMockReportSummary(range);
-  }
-
   const [orders, payments, riders, customers] = await Promise.all([
     getAllOrders(),
     getAllPayments(),
@@ -682,8 +852,7 @@ export async function getReportSummary(
           ? `Week of ${format(boundary, "dd MMM yyyy")}`
           : format(boundary, "MMMM yyyy"),
     totalOrders: filteredOrders.length,
-    deliveredOrders: filteredOrders.filter((order) => order.orderStatus === "delivered")
-      .length,
+    deliveredOrders: filteredOrders.filter((order) => order.orderStatus === "delivered").length,
     cashCollected: filteredPayments
       .filter((payment) => payment.paymentMethod === "cash")
       .reduce((sum, payment) => sum + payment.amount, 0),
@@ -697,16 +866,10 @@ export async function getReportSummary(
         riderId: rider.id,
         riderName: rider.name,
         cashCollected: filteredPayments
-          .filter(
-            (payment) =>
-              payment.riderId === rider.id && payment.paymentMethod === "cash",
-          )
+          .filter((payment) => payment.riderId === rider.id && payment.paymentMethod === "cash")
           .reduce((sum, payment) => sum + payment.amount, 0),
         onlineClaimed: filteredPayments
-          .filter(
-            (payment) =>
-              payment.riderId === rider.id && payment.paymentMethod !== "cash",
-          )
+          .filter((payment) => payment.riderId === rider.id && payment.paymentMethod !== "cash")
           .reduce((sum, payment) => sum + payment.amount, 0),
         pendingReconciliation: filteredPayments
           .filter(
@@ -723,39 +886,67 @@ export async function getReportSummary(
 }
 
 export async function getRiderDashboard(user: SessionUser) {
-  if (!hasSupabaseEnv()) {
-    const fallback = getMockRiderDashboard(user);
-    const customerMap = new Map(mockCustomers.map((customer) => [customer.id, customer]));
+  const effectiveRiderId = await resolveEffectiveRiderId(user);
 
+  if (!effectiveRiderId) {
     return {
-      ...fallback,
-      deliveries: fallback.assignedOrders.map((order) => ({
-        order,
-        customer: customerMap.get(order.customerId),
-      })),
+      rider: undefined,
+      todayDeliveriesCount: 0,
+      pendingDeliveriesCount: 0,
+      cashCollectedToday: 0,
+      deliveries: [],
     };
   }
 
-  const [orders, payments, customers, riders] = await Promise.all([
-    getAllOrders(),
-    getAllPayments(),
-    getAllCustomers(),
-    getAllRiders(),
+  const supabase = await createServerSupabaseClient();
+  const [riderResult, ordersResult, paymentsResult] = await Promise.all([
+    supabase.from("riders").select(RIDER_SELECT).eq("id", effectiveRiderId).maybeSingle(),
+    supabase
+      .from("orders")
+      .select(ORDER_SELECT)
+      .eq("rider_id", effectiveRiderId)
+      .order("delivery_date", { ascending: false }),
+    supabase
+      .from("payments")
+      .select(PAYMENT_SELECT)
+      .eq("rider_id", effectiveRiderId)
+      .order("received_at", { ascending: false }),
   ]);
 
-  const riderId = resolveRiderId(user, riders);
+  if (riderResult.error) {
+    throw riderResult.error;
+  }
 
-  const assignedOrders = orders.filter((order) => order.riderId === riderId);
+  if (ordersResult.error) {
+    throw ordersResult.error;
+  }
+
+  if (paymentsResult.error) {
+    throw paymentsResult.error;
+  }
+
+  const rider = riderResult.data
+    ? mapRider(riderResult.data as Record<string, unknown>)
+    : undefined;
+  const assignedOrders = (ordersResult.data ?? []).map((row) =>
+    mapOrder(row as Record<string, unknown>),
+  );
+  const payments = (paymentsResult.data ?? []).map((row) =>
+    mapPayment(row as Record<string, unknown>),
+  );
   const todaysDeliveries = assignedOrders.filter((order) =>
     isSameDay(parseISO(order.deliveryDate), todayDate()),
   );
+  const customers = await fetchCustomersByIds(
+    Array.from(new Set(todaysDeliveries.map((order) => order.customerId))),
+  );
+  const customerMap = new Map(customers.map((customer) => [customer.id, customer]));
 
   return {
-    rider: riders.find((rider) => rider.id === riderId),
+    rider,
     todayDeliveriesCount: todaysDeliveries.length,
-    pendingDeliveriesCount: todaysDeliveries.filter(
-      (order) => order.orderStatus !== "delivered",
-    ).length,
+    pendingDeliveriesCount: todaysDeliveries.filter((order) => order.orderStatus !== "delivered")
+      .length,
     cashCollectedToday: payments
       .filter(
         (payment) =>
@@ -766,43 +957,43 @@ export async function getRiderDashboard(user: SessionUser) {
       .reduce((sum, payment) => sum + payment.amount, 0),
     deliveries: todaysDeliveries.map((order) => ({
       order,
-      customer: customers.find((customer) => customer.id === order.customerId),
+      customer: customerMap.get(order.customerId),
     })),
   };
 }
 
 export async function getRiderDeliveries(user: SessionUser) {
-  if (!hasSupabaseEnv()) {
-    const riderId = user.riderId;
-    const items = mockOrders
-      .filter((order) => order.riderId === riderId)
-      .sort((a, b) => a.deliveryDate.localeCompare(b.deliveryDate))
-      .map((order) => ({
-        order,
-        customer: mockCustomers.find((customer) => customer.id === order.customerId),
-      }));
+  const effectiveRiderId = await resolveEffectiveRiderId(user);
 
+  if (!effectiveRiderId) {
     return {
-      items,
-      totalCount: items.length,
-      pendingCount: items.filter(({ order }) => order.orderStatus !== "delivered").length,
-      deliveredCount: items.filter(({ order }) => order.orderStatus === "delivered").length,
+      items: [],
+      totalCount: 0,
+      pendingCount: 0,
+      deliveredCount: 0,
     };
   }
 
-  const [orders, customers, riders] = await Promise.all([
-    getAllOrders(),
-    getAllCustomers(),
-    getAllRiders(),
-  ]);
+  const supabase = await createServerSupabaseClient();
+  const { data, error } = await supabase
+    .from("orders")
+    .select(ORDER_SELECT)
+    .eq("rider_id", effectiveRiderId)
+    .order("delivery_date", { ascending: true });
 
-  const riderId = resolveRiderId(user, riders);
+  if (error) {
+    throw error;
+  }
+
+  const orders = (data ?? []).map((row) => mapOrder(row as Record<string, unknown>));
+  const customers = await fetchCustomersByIds(
+    Array.from(new Set(orders.map((order) => order.customerId))),
+  );
+  const customerMap = new Map(customers.map((customer) => [customer.id, customer]));
   const items = orders
-    .filter((order) => order.riderId === riderId)
-    .sort((a, b) => a.deliveryDate.localeCompare(b.deliveryDate))
     .map((order) => ({
       order,
-      customer: customers.find((customer) => customer.id === order.customerId),
+      customer: customerMap.get(order.customerId),
     }));
 
   return {
@@ -814,49 +1005,51 @@ export async function getRiderDeliveries(user: SessionUser) {
 }
 
 export async function getRiderCollections(user: SessionUser) {
-  if (!hasSupabaseEnv()) {
-    const riderId = user.riderId;
-    const riderPayments = mockPayments
-      .filter((payment) => payment.riderId === riderId)
-      .sort((a, b) => b.receivedAt.localeCompare(a.receivedAt));
+  const effectiveRiderId = await resolveEffectiveRiderId(user);
 
+  if (!effectiveRiderId) {
     return {
-      items: riderPayments.map((payment) => ({
-        payment,
-        customer: mockCustomers.find((customer) => customer.id === payment.customerId),
-        order: mockOrders.find((order) => order.id === payment.orderId),
-      })),
-      cashCollectedToday: riderPayments
-        .filter(
-          (payment) =>
-            payment.paymentMethod === "cash" &&
-            isSameDay(parseISO(payment.receivedAt), todayDate()),
-        )
-        .reduce((sum, payment) => sum + payment.amount, 0),
-      pendingVerificationAmount: riderPayments
-        .filter((payment) => payment.paymentStatus === "pending_verification")
-        .reduce((sum, payment) => sum + payment.amount, 0),
-      totalRecordedAmount: riderPayments.reduce((sum, payment) => sum + payment.amount, 0),
+      items: [],
+      cashCollectedToday: 0,
+      pendingVerificationAmount: 0,
+      totalRecordedAmount: 0,
     };
   }
 
-  const [payments, customers, orders, riders] = await Promise.all([
-    getAllPayments(),
-    getAllCustomers(),
-    getAllOrders(),
-    getAllRiders(),
-  ]);
+  const supabase = await createServerSupabaseClient();
+  const { data, error } = await supabase
+    .from("payments")
+    .select(PAYMENT_SELECT)
+    .eq("rider_id", effectiveRiderId)
+    .order("received_at", { ascending: false });
 
-  const riderId = resolveRiderId(user, riders);
-  const riderPayments = payments
-    .filter((payment) => payment.riderId === riderId)
-    .sort((a, b) => b.receivedAt.localeCompare(a.receivedAt));
+  if (error) {
+    throw error;
+  }
+
+  const riderPayments = (data ?? []).map((row) =>
+    mapPayment(row as Record<string, unknown>),
+  );
+  const [customers, orders] = await Promise.all([
+    fetchCustomersByIds(Array.from(new Set(riderPayments.map((payment) => payment.customerId)))),
+    fetchOrdersByIds(
+      Array.from(
+        new Set(
+          riderPayments
+            .map((payment) => payment.orderId)
+            .filter((orderId): orderId is string => Boolean(orderId)),
+        ),
+      ),
+    ),
+  ]);
+  const customerMap = new Map(customers.map((customer) => [customer.id, customer]));
+  const orderMap = new Map(orders.map((order) => [order.id, order]));
 
   return {
     items: riderPayments.map((payment) => ({
       payment,
-      customer: customers.find((customer) => customer.id === payment.customerId),
-      order: orders.find((order) => order.id === payment.orderId),
+      customer: customerMap.get(payment.customerId),
+      order: payment.orderId ? orderMap.get(payment.orderId) : undefined,
     })),
     cashCollectedToday: riderPayments
       .filter(
@@ -873,10 +1066,6 @@ export async function getRiderCollections(user: SessionUser) {
 }
 
 export async function getAreas() {
-  if (!hasSupabaseEnv()) {
-    return getMockAreas();
-  }
-
   const customers = await getAllCustomers();
   return Array.from(new Set(customers.map((customer) => customer.area)));
 }

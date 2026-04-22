@@ -1,4 +1,4 @@
-import Link from "next/link";
+ï»¿import Link from "next/link";
 import { notFound } from "next/navigation";
 
 import { PageHeader } from "@/components/layout/page-header";
@@ -28,7 +28,7 @@ export default async function CustomerDetailPage({ params }: CustomerDetailProps
       <PageHeader
         eyebrow="Customer detail"
         title={detail.customer.name}
-        description={`${detail.customer.address} • ${detail.customer.area}`}
+        description={`${detail.customer.address} - ${detail.customer.area}`}
         actions={
           <>
             <Link href={`/admin/orders/new?customerId=${detail.customer.id}`} className={cn(buttonVariants({ size: "lg" }), "h-12 rounded-2xl")}>
@@ -69,7 +69,7 @@ export default async function CustomerDetailPage({ params }: CustomerDetailProps
             <p>Service ends: {detail.customer.serviceEndDate}</p>
             {detail.serviceSummary ? (
               <p>
-                Current month estimate: {detail.serviceSummary.remainingDays} days • {formatCurrency(detail.serviceSummary.estimatedAmount)}
+                Current month estimate: {detail.serviceSummary.remainingDays} days - {formatCurrency(detail.serviceSummary.estimatedAmount)}
               </p>
             ) : null}
             <p>Notes: {detail.customer.notes || "No special notes"}</p>

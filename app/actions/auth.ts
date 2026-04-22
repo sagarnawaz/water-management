@@ -2,25 +2,61 @@
 
 import { redirect } from "next/navigation";
 
-import { setMockSession, clearMockSession } from "@/lib/auth/session";
 import { roleHome } from "@/lib/constants";
-import { hasSupabaseEnv } from "@/lib/supabase/config";
+import { createServiceRoleSupabaseClient } from "@/lib/supabase/admin";
 import { createServerSupabaseClient } from "@/lib/supabase/server";
-import { authenticateDemoUser } from "@/services/mock-data";
 import { loginSchema, type LoginInput } from "@/validations/auth";
 
-type AuthResult = {
-  success: boolean;
+export type AuthFormState = {
   message?: string;
-  redirectTo?: string;
 };
 
-export async function loginAction(input: LoginInput): Promise<AuthResult> {
+function isLikelyEmail(value: string) {
+  return value.includes("@");
+}
+
+async function resolveSupabaseLoginIdentifier(identifier: string) {
+  if (isLikelyEmail(identifier)) {
+    return identifier;
+  }
+
+  const admin = createServiceRoleSupabaseClient();
+
+  if (!admin) {
+    return null;
+  }
+
+  const { data: profile } = await admin
+    .from("profiles")
+    .select("auth_user_id")
+    .eq("phone", identifier)
+    .maybeSingle();
+
+  if (!profile?.auth_user_id) {
+    return null;
+  }
+
+  const { data, error } = await admin.auth.admin.getUserById(profile.auth_user_id);
+
+  if (error || !data.user?.email) {
+    return null;
+  }
+
+  return data.user.email;
+}
+
+export async function loginAction(
+  _previousState: AuthFormState | undefined,
+  formData: FormData,
+): Promise<AuthFormState> {
+  const input = {
+    identifier: String(formData.get("identifier") ?? ""),
+    password: String(formData.get("password") ?? ""),
+  } satisfies LoginInput;
   const parsed = loginSchema.safeParse(input);
 
   if (!parsed.success) {
     return {
-      success: false,
       message:
         parsed.error.flatten().fieldErrors.identifier?.[0] ??
         parsed.error.flatten().fieldErrors.password?.[0] ??
@@ -28,95 +64,55 @@ export async function loginAction(input: LoginInput): Promise<AuthResult> {
     };
   }
 
-  if (hasSupabaseEnv()) {
-    const supabase = await createServerSupabaseClient();
-    const { error } = await supabase.auth.signInWithPassword({
-      email: parsed.data.identifier,
-      password: parsed.data.password,
-    });
+  const loginIdentifier = await resolveSupabaseLoginIdentifier(parsed.data.identifier);
 
-    if (error) {
-      return {
-        success: false,
-        message: error.message,
-      };
-    }
-
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
-
-    if (!user) {
-      return {
-        success: false,
-        message: "Unable to load your account.",
-      };
-    }
-
-    const { data: profile } = await supabase
-      .from("profiles")
-      .select("id, full_name, role, phone, rider_id")
-      .eq("auth_user_id", user.id)
-      .maybeSingle();
-
-    if (!profile || (profile.role !== "admin" && profile.role !== "rider")) {
-      return {
-        success: false,
-        message: "Your profile is missing a valid role.",
-      };
-    }
-
-    const role = profile.role as "admin" | "rider";
-    let riderId = profile.rider_id ?? undefined;
-
-    if (role === "rider" && !riderId) {
-      const { data: rider } = await supabase
-        .from("riders")
-        .select("id")
-        .eq("auth_user_id", user.id)
-        .maybeSingle();
-
-      riderId = rider?.id;
-    }
-
-    await setMockSession({
-      id: profile.id,
-      role,
-      name: profile.full_name ?? user.email ?? "User",
-      email: user.email ?? parsed.data.identifier,
-      phone: profile.phone ?? undefined,
-      riderId,
-    });
-
+  if (!loginIdentifier) {
     return {
-      success: true,
-      redirectTo: roleHome[role],
+      message: isLikelyEmail(parsed.data.identifier)
+        ? "Unable to find your account."
+        : "Use your account email to sign in. Phone lookup is not available for this setup yet.",
     };
   }
 
-  const user = authenticateDemoUser(parsed.data.identifier, parsed.data.password);
+  const supabase = await createServerSupabaseClient();
+  const { error } = await supabase.auth.signInWithPassword({
+    email: loginIdentifier,
+    password: parsed.data.password,
+  });
+
+  if (error) {
+    return {
+      message: error.message,
+    };
+  }
+
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
 
   if (!user) {
     return {
-      success: false,
-      message: "Use one of the demo accounts shown below the form.",
+      message: "Unable to load your account.",
     };
   }
 
-  await setMockSession(user);
+  const { data: profile } = await supabase
+    .from("profiles")
+    .select("role")
+    .eq("auth_user_id", user.id)
+    .maybeSingle();
 
-  return {
-    success: true,
-    redirectTo: roleHome[user.role],
-  };
+  if (!profile || (profile.role !== "admin" && profile.role !== "rider")) {
+    return {
+      message: "Your profile is missing a valid role.",
+    };
+  }
+
+  redirect(roleHome[profile.role]);
 }
 
 export async function logoutAction() {
-  if (hasSupabaseEnv()) {
-    const supabase = await createServerSupabaseClient();
-    await supabase.auth.signOut();
-  }
-
-  await clearMockSession();
+  const supabase = await createServerSupabaseClient();
+  await supabase.auth.signOut();
   redirect("/login");
 }

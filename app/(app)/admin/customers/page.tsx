@@ -1,4 +1,4 @@
-import Link from "next/link";
+ï»¿import Link from "next/link";
 import { Plus, Search } from "lucide-react";
 
 import { EmptyState } from "@/components/empty-state";
@@ -8,7 +8,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { formatCurrency } from "@/lib/format";
 import { cn } from "@/lib/utils";
-import { getCustomer, listCustomers, listRiders } from "@/services/data";
+import { listCustomerSummaries, listRiders } from "@/services/data";
 
 type CustomersPageProps = {
   searchParams: Promise<{
@@ -19,15 +19,12 @@ type CustomersPageProps = {
 
 export default async function CustomersPage({ searchParams }: CustomersPageProps) {
   const params = await searchParams;
-  const [customers, riders] = await Promise.all([listCustomers(params.q), listRiders()]);
+  const [customerSummaries, riders] = await Promise.all([
+    listCustomerSummaries(params.q),
+    listRiders(),
+  ]);
   const view = params.view === "list" ? "list" : "cards";
   const riderMap = new Map(riders.map((rider) => [rider.id, rider.name]));
-  const customerDetails = await Promise.all(
-    customers.map(async (customer) => ({
-      customer,
-      detail: await getCustomer(customer.id),
-    })),
-  );
 
   return (
     <div className="space-y-6">
@@ -36,7 +33,10 @@ export default async function CustomersPage({ searchParams }: CustomersPageProps
         title="Customer management"
         description="Search customers, review service plans, and keep rider assignments and due balances aligned."
         actions={
-          <Link href="/admin/customers/new" className={cn(buttonVariants({ size: "lg" }), "h-12 rounded-2xl")}>
+          <Link
+            href="/admin/customers/new"
+            className={cn(buttonVariants({ size: "lg" }), "h-12 rounded-2xl")}
+          >
             <Plus className="size-4" />
             Add customer
           </Link>
@@ -79,14 +79,14 @@ export default async function CustomersPage({ searchParams }: CustomersPageProps
         </CardContent>
       </Card>
 
-      {customers.length === 0 ? (
+      {customerSummaries.length === 0 ? (
         <EmptyState
           title="No customers found"
           description="Try a different search term or add a new customer."
         />
       ) : (
         <div className={cn("grid gap-4", view === "cards" ? "lg:grid-cols-2" : "grid-cols-1")}>
-          {customerDetails.map(({ customer, detail }) => (
+          {customerSummaries.map(({ customer, totals }) => (
             <Card key={customer.id}>
               <CardContent className="flex flex-col gap-4 p-5">
                 <div className="flex flex-wrap items-start justify-between gap-3">
@@ -95,17 +95,17 @@ export default async function CustomersPage({ searchParams }: CustomersPageProps
                     <p className="text-sm text-muted-foreground">{customer.phone}</p>
                   </div>
                   <div className="rounded-2xl bg-amber-500/10 px-3 py-2 text-sm font-medium text-amber-700">
-                    Due {formatCurrency(detail?.totals.currentDue ?? 0)}
+                    Due {formatCurrency(totals.currentDue)}
                   </div>
                 </div>
                 <div className="space-y-1 text-sm text-muted-foreground">
                   <p>{customer.address}</p>
                   <p>{customer.area}</p>
                   <p>
-                    {customer.dailyBottleQty} bottles / day • {riderMap.get(customer.assignedRiderId ?? "") || "No rider assigned"}
+                    {customer.dailyBottleQty} bottles / day - {riderMap.get(customer.assignedRiderId ?? "") || "No rider assigned"}
                   </p>
                   <p>
-                    {customer.isActive ? "Active" : "Inactive"} • Month {customer.billingMonth}
+                    {customer.isActive ? "Active" : "Inactive"} - Month {customer.billingMonth}
                   </p>
                 </div>
                 <div className="flex flex-wrap gap-2">

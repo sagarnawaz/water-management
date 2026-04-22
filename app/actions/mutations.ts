@@ -6,7 +6,6 @@ import { endOfMonth, format, parseISO, startOfMonth } from "date-fns";
 
 import { normalizeServiceMonth } from "@/lib/customer-service";
 import { requireUser } from "@/lib/auth/session";
-import { hasSupabaseEnv } from "@/lib/supabase/config";
 import { createServerSupabaseClient } from "@/lib/supabase/server";
 import { cancelPendingSubscriptionOrders, syncCustomerSubscriptionOrders } from "@/services/subscription-sync";
 import type { DeliveryPaymentOutcome, PaymentMethod } from "@/types/domain";
@@ -31,7 +30,7 @@ function buildMutationResult(path: string, message: string): MutationResult {
 }
 
 async function uploadOptionalProof(file: File | null) {
-  if (!file || file.size === 0 || !hasSupabaseEnv()) {
+  if (!file || file.size === 0) {
     return null;
   }
 
@@ -69,57 +68,55 @@ export async function saveCustomerAction(input: CustomerInput): Promise<Mutation
     };
   }
 
-  if (hasSupabaseEnv()) {
-    const supabase = await createServerSupabaseClient();
-    const normalizedBillingMonth = normalizeServiceMonth(parsed.data.billingMonth);
-    const normalizedServiceStartDate = format(
-      parseISO(parsed.data.serviceStartDate),
-      "yyyy-MM-dd",
-    );
-    const serviceEndDate = format(
-      endOfMonth(startOfMonth(parseISO(normalizedBillingMonth))),
-      "yyyy-MM-dd",
-    );
-    const isActive = parsed.data.serviceStatus === "active";
-    const payload = {
-      name: parsed.data.name,
-      phone: parsed.data.phone,
-      alternate_phone: parsed.data.alternatePhone || null,
-      address: parsed.data.address,
-      area: parsed.data.area,
-      daily_bottle_qty: parsed.data.dailyBottleQty,
-      price_per_bottle: parsed.data.pricePerBottle,
-      default_payment_method: parsed.data.paymentMethod,
-      assigned_rider_id: parsed.data.assignedRiderId || null,
-      billing_month: normalizedBillingMonth,
-      service_start_date: normalizedServiceStartDate,
-      service_end_date: serviceEndDate,
-      activated_at: isActive ? new Date().toISOString() : null,
-      is_active: isActive,
-      notes: parsed.data.notes || null,
-    };
+  const supabase = await createServerSupabaseClient();
+  const normalizedBillingMonth = normalizeServiceMonth(parsed.data.billingMonth);
+  const normalizedServiceStartDate = format(
+    parseISO(parsed.data.serviceStartDate),
+    "yyyy-MM-dd",
+  );
+  const serviceEndDate = format(
+    endOfMonth(startOfMonth(parseISO(normalizedBillingMonth))),
+    "yyyy-MM-dd",
+  );
+  const isActive = parsed.data.serviceStatus === "active";
+  const payload = {
+    name: parsed.data.name,
+    phone: parsed.data.phone,
+    alternate_phone: parsed.data.alternatePhone || null,
+    address: parsed.data.address,
+    area: parsed.data.area,
+    daily_bottle_qty: parsed.data.dailyBottleQty,
+    price_per_bottle: parsed.data.pricePerBottle,
+    default_payment_method: parsed.data.paymentMethod,
+    assigned_rider_id: parsed.data.assignedRiderId || null,
+    billing_month: normalizedBillingMonth,
+    service_start_date: normalizedServiceStartDate,
+    service_end_date: serviceEndDate,
+    activated_at: isActive ? new Date().toISOString() : null,
+    is_active: isActive,
+    notes: parsed.data.notes || null,
+  };
 
-    let customerId = parsed.data.id;
-    if (parsed.data.id) {
-      await supabase.from("customers").update(payload).eq("id", parsed.data.id);
+  let customerId = parsed.data.id;
+  if (parsed.data.id) {
+    await supabase.from("customers").update(payload).eq("id", parsed.data.id);
+  } else {
+    const { data: createdCustomer } = await supabase
+      .from("customers")
+      .insert(payload)
+      .select("id")
+      .single();
+
+    customerId = createdCustomer?.id;
+  }
+
+  if (customerId) {
+    if (isActive) {
+      await syncCustomerSubscriptionOrders({
+        customerId,
+      });
     } else {
-      const { data: createdCustomer } = await supabase
-        .from("customers")
-        .insert(payload)
-        .select("id")
-        .single();
-
-      customerId = createdCustomer?.id;
-    }
-
-    if (customerId) {
-      if (isActive) {
-        await syncCustomerSubscriptionOrders({
-          customerId,
-        });
-      } else {
-        await cancelPendingSubscriptionOrders(customerId);
-      }
+      await cancelPendingSubscriptionOrders(customerId);
     }
   }
 
@@ -148,20 +145,18 @@ export async function saveRiderAction(input: RiderInput): Promise<MutationResult
     };
   }
 
-  if (hasSupabaseEnv()) {
-    const supabase = await createServerSupabaseClient();
-    const payload = {
-      name: parsed.data.name,
-      phone: parsed.data.phone,
-      vehicle_number: parsed.data.vehicleNumber,
-      status: parsed.data.status,
-    };
+  const supabase = await createServerSupabaseClient();
+  const payload = {
+    name: parsed.data.name,
+    phone: parsed.data.phone,
+    vehicle_number: parsed.data.vehicleNumber,
+    status: parsed.data.status,
+  };
 
-    if (parsed.data.id) {
-      await supabase.from("riders").update(payload).eq("id", parsed.data.id);
-    } else {
-      await supabase.from("riders").insert(payload);
-    }
+  if (parsed.data.id) {
+    await supabase.from("riders").update(payload).eq("id", parsed.data.id);
+  } else {
+    await supabase.from("riders").insert(payload);
   }
 
   revalidatePath("/admin/riders");
@@ -186,63 +181,61 @@ export async function saveOrderAction(input: OrderInput): Promise<MutationResult
   const totalAmount = parsed.data.bottleQty * parsed.data.pricePerBottle;
   const now = new Date().toISOString();
 
-  if (hasSupabaseEnv()) {
-    const supabase = await createServerSupabaseClient();
-    let customerId = parsed.data.customerId;
+  const supabase = await createServerSupabaseClient();
+  let customerId = parsed.data.customerId;
 
-    if (!customerId) {
-      const { data: createdCustomer } = await supabase
-        .from("customers")
-        .insert({
-          name: parsed.data.newCustomerName,
-          phone: parsed.data.newCustomerPhone,
-          address: parsed.data.newCustomerAddress,
-          area: parsed.data.newCustomerArea,
-        })
-        .select("id")
-        .single();
+  if (!customerId) {
+    const { data: createdCustomer } = await supabase
+      .from("customers")
+      .insert({
+        name: parsed.data.newCustomerName,
+        phone: parsed.data.newCustomerPhone,
+        address: parsed.data.newCustomerAddress,
+        area: parsed.data.newCustomerArea,
+      })
+      .select("id")
+      .single();
 
-      customerId = createdCustomer?.id;
-    }
+    customerId = createdCustomer?.id;
+  }
 
-    const orderPayload = {
-      customer_id: customerId,
-      rider_id: parsed.data.riderId,
-      bottle_qty: parsed.data.bottleQty,
-      price_per_bottle: parsed.data.pricePerBottle,
-      total_amount: totalAmount,
-      delivery_date: parsed.data.deliveryDate,
-      notes: parsed.data.notes || null,
-      order_status: parsed.data.id ? undefined : "assigned",
-      expected_payment_method: parsed.data.expectedPaymentMethod,
-      payment_status:
-        parsed.data.expectedPaymentMethod === "credit" ? "due" : "unpaid",
-      created_by: user.id,
-      updated_at: now,
-    };
+  const orderPayload = {
+    customer_id: customerId,
+    rider_id: parsed.data.riderId,
+    bottle_qty: parsed.data.bottleQty,
+    price_per_bottle: parsed.data.pricePerBottle,
+    total_amount: totalAmount,
+    delivery_date: parsed.data.deliveryDate,
+    notes: parsed.data.notes || null,
+    order_status: parsed.data.id ? undefined : "assigned",
+    expected_payment_method: parsed.data.expectedPaymentMethod,
+    payment_status:
+      parsed.data.expectedPaymentMethod === "credit" ? "due" : "unpaid",
+    created_by: user.id,
+    updated_at: now,
+  };
 
-    if (parsed.data.id) {
-      await supabase.from("orders").update(orderPayload).eq("id", parsed.data.id);
-    } else {
-      const { data: createdOrder } = await supabase
-        .from("orders")
-        .insert({
-          ...orderPayload,
-          created_at: now,
-        })
-        .select("id")
-        .single();
+  if (parsed.data.id) {
+    await supabase.from("orders").update(orderPayload).eq("id", parsed.data.id);
+  } else {
+    const { data: createdOrder } = await supabase
+      .from("orders")
+      .insert({
+        ...orderPayload,
+        created_at: now,
+      })
+      .select("id")
+      .single();
 
-      if (createdOrder?.id && customerId) {
-        await supabase.from("ledger_entries").insert({
-          customer_id: customerId,
-          order_id: createdOrder.id,
-          entry_type: "order",
-          debit: totalAmount,
-          credit: 0,
-          description: "Order created",
-        });
-      }
+    if (createdOrder?.id && customerId) {
+      await supabase.from("ledger_entries").insert({
+        customer_id: customerId,
+        order_id: createdOrder.id,
+        entry_type: "order",
+        debit: totalAmount,
+        credit: 0,
+        description: "Order created",
+      });
     }
   }
 
@@ -257,16 +250,14 @@ export async function saveOrderAction(input: OrderInput): Promise<MutationResult
 export async function cancelOrderAction(orderId: string) {
   await requireUser("admin");
 
-  if (hasSupabaseEnv()) {
-    const supabase = await createServerSupabaseClient();
-    await supabase
-      .from("orders")
-      .update({
-        order_status: "cancelled",
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", orderId);
-  }
+  const supabase = await createServerSupabaseClient();
+  await supabase
+    .from("orders")
+    .update({
+      order_status: "cancelled",
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", orderId);
 
   revalidatePath("/admin/orders");
   return buildMutationResult("/admin/orders", "Order cancelled.");
@@ -282,17 +273,15 @@ export async function reviewPaymentAction(
 ) {
   const user = await requireUser("admin");
 
-  if (hasSupabaseEnv()) {
-    const supabase = await createServerSupabaseClient();
-    await supabase
-      .from("payments")
-      .update({
-        payment_status: decision,
-        verified_by: user.id,
-        verified_at: new Date().toISOString(),
-      })
-      .eq("id", paymentId);
-  }
+  const supabase = await createServerSupabaseClient();
+  await supabase
+    .from("payments")
+    .update({
+      payment_status: decision,
+      verified_by: user.id,
+      verified_at: new Date().toISOString(),
+    })
+    .eq("id", paymentId);
 
   revalidatePath("/admin/payments");
 }
@@ -313,37 +302,35 @@ export async function saveManualPaymentAction(
     };
   }
 
-  if (hasSupabaseEnv()) {
-    const supabase = await createServerSupabaseClient();
-    const paymentStatus =
-      parsed.data.paymentMethod === "cash" ? "verified" : "pending_verification";
+  const supabase = await createServerSupabaseClient();
+  const paymentStatus =
+    parsed.data.paymentMethod === "cash" ? "verified" : "pending_verification";
 
-    const { data: payment } = await supabase
-      .from("payments")
-      .insert({
-        order_id: parsed.data.orderId || null,
-        customer_id: parsed.data.customerId,
-        rider_id: parsed.data.riderId || null,
-        amount: parsed.data.amount,
-        payment_method: parsed.data.paymentMethod,
-        payment_status: paymentStatus,
-        transaction_reference: parsed.data.transactionReference || null,
-        notes: parsed.data.notes || null,
-        received_at: new Date().toISOString(),
-      })
-      .select("id")
-      .single();
-
-    await supabase.from("ledger_entries").insert({
-      customer_id: parsed.data.customerId,
-      payment_id: payment?.id,
+  const { data: payment } = await supabase
+    .from("payments")
+    .insert({
       order_id: parsed.data.orderId || null,
-      entry_type: "payment",
-      debit: 0,
-      credit: parsed.data.amount,
-      description: "Manual payment entry",
-    });
-  }
+      customer_id: parsed.data.customerId,
+      rider_id: parsed.data.riderId || null,
+      amount: parsed.data.amount,
+      payment_method: parsed.data.paymentMethod,
+      payment_status: paymentStatus,
+      transaction_reference: parsed.data.transactionReference || null,
+      notes: parsed.data.notes || null,
+      received_at: new Date().toISOString(),
+    })
+    .select("id")
+    .single();
+
+  await supabase.from("ledger_entries").insert({
+    customer_id: parsed.data.customerId,
+    payment_id: payment?.id,
+    order_id: parsed.data.orderId || null,
+    entry_type: "payment",
+    debit: 0,
+    credit: parsed.data.amount,
+    description: "Manual payment entry",
+  });
 
   revalidatePath("/admin/payments");
   revalidatePath("/admin/ledger");
@@ -404,62 +391,60 @@ export async function markDeliveryAction(formData: FormData): Promise<MutationRe
 
   const mapping = paymentOutcomeMap[parsed.data.paymentOutcome];
 
-  if (hasSupabaseEnv()) {
-    const supabase = await createServerSupabaseClient();
+  const supabase = await createServerSupabaseClient();
 
-    await supabase
-      .from("orders")
-      .update({
-        delivered_qty: parsed.data.deliveredQty,
-        amount_received:
-          parsed.data.paymentOutcome === "online_claimed"
-            ? 0
-            : parsed.data.amountReceived || 0,
-        due_amount: remainingDue,
-        payment_status: mapping.orderPaymentStatus,
-        order_status: "delivered",
-        transaction_reference: parsed.data.transactionReference || null,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", parsed.data.orderId);
+  await supabase
+    .from("orders")
+    .update({
+      delivered_qty: parsed.data.deliveredQty,
+      amount_received:
+        parsed.data.paymentOutcome === "online_claimed"
+          ? 0
+          : parsed.data.amountReceived || 0,
+      due_amount: remainingDue,
+      payment_status: mapping.orderPaymentStatus,
+      order_status: "delivered",
+      transaction_reference: parsed.data.transactionReference || null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", parsed.data.orderId);
 
-    if (
-      parsed.data.paymentOutcome !== "unpaid_due" &&
-      (parsed.data.amountReceived || parsed.data.paymentOutcome === "online_claimed")
-    ) {
-      const { data: payment } = await supabase
-        .from("payments")
-        .insert({
-          order_id: parsed.data.orderId,
-          customer_id: String(formData.get("customerId")),
-          rider_id: user.riderId || null,
-          amount:
-            parsed.data.paymentOutcome === "online_claimed"
-              ? totalAmount
-              : parsed.data.amountReceived || 0,
-          payment_method: mapping.method,
-          payment_status: mapping.recordStatus,
-          transaction_reference: parsed.data.transactionReference || null,
-          proof_url: proofUrl,
-          notes: parsed.data.notes || null,
-          received_at: new Date().toISOString(),
-        })
-        .select("id")
-        .single();
-
-      await supabase.from("ledger_entries").insert({
-        customer_id: String(formData.get("customerId")),
+  if (
+    parsed.data.paymentOutcome !== "unpaid_due" &&
+    (parsed.data.amountReceived || parsed.data.paymentOutcome === "online_claimed")
+  ) {
+    const { data: payment } = await supabase
+      .from("payments")
+      .insert({
         order_id: parsed.data.orderId,
-        payment_id: payment?.id,
-        entry_type: "payment",
-        debit: 0,
-        credit:
+        customer_id: String(formData.get("customerId")),
+        rider_id: user.riderId || null,
+        amount:
           parsed.data.paymentOutcome === "online_claimed"
             ? totalAmount
             : parsed.data.amountReceived || 0,
-        description: "Delivery collection",
-      });
-    }
+        payment_method: mapping.method,
+        payment_status: mapping.recordStatus,
+        transaction_reference: parsed.data.transactionReference || null,
+        proof_url: proofUrl,
+        notes: parsed.data.notes || null,
+        received_at: new Date().toISOString(),
+      })
+      .select("id")
+      .single();
+
+    await supabase.from("ledger_entries").insert({
+      customer_id: String(formData.get("customerId")),
+      order_id: parsed.data.orderId,
+      payment_id: payment?.id,
+      entry_type: "payment",
+      debit: 0,
+      credit:
+        parsed.data.paymentOutcome === "online_claimed"
+          ? totalAmount
+          : parsed.data.amountReceived || 0,
+      description: "Delivery collection",
+    });
   }
 
   revalidatePath("/rider");

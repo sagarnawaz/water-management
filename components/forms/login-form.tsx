@@ -1,74 +1,43 @@
 "use client";
 
-import { useState, useTransition } from "react";
-import { useRouter } from "next/navigation";
-import { useForm } from "react-hook-form";
-import { zodResolver } from "@hookform/resolvers/zod";
+import { useActionState } from "react";
 
-import { loginAction } from "@/app/actions/auth";
+import { loginAction, type AuthFormState } from "@/app/actions/auth";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { loginSchema, type LoginInput } from "@/validations/auth";
 
 export function LoginForm() {
-  const router = useRouter();
-  const [serverError, setServerError] = useState<string | null>(null);
-  const [isPending, startTransition] = useTransition();
-  const {
-    register,
-    handleSubmit,
-    formState: { errors },
-  } = useForm<LoginInput>({
-    resolver: zodResolver(loginSchema),
-    defaultValues: {
-      identifier: "",
-      password: "",
-    },
-  });
-
-  const onSubmit = handleSubmit((values) => {
-    setServerError(null);
-    startTransition(async () => {
-      const result = await loginAction(values);
-      if (!result.success) {
-        setServerError(result.message ?? "Unable to sign in.");
-        return;
-      }
-      router.push(result.redirectTo ?? "/");
-      router.refresh();
-    });
-  });
+  const initialState: AuthFormState = {};
+  const [state, formAction, isPending] = useActionState(loginAction, initialState);
 
   return (
-    <form className="space-y-4" onSubmit={onSubmit}>
+    <form className="space-y-4" action={formAction}>
       <div className="space-y-2">
         <Label htmlFor="identifier">Email or phone</Label>
         <Input
           id="identifier"
+          name="identifier"
           placeholder="Enter your email or phone"
           autoComplete="username"
-          {...register("identifier")}
+          required
+          minLength={3}
         />
-        {errors.identifier ? (
-          <p className="text-sm text-destructive">{errors.identifier.message}</p>
-        ) : null}
       </div>
       <div className="space-y-2">
         <Label htmlFor="password">Password</Label>
         <Input
           id="password"
+          name="password"
           type="password"
-          placeholder="••••••••"
+          placeholder="********"
           autoComplete="current-password"
-          {...register("password")}
+          required
+          minLength={6}
         />
-        {errors.password ? (
-          <p className="text-sm text-destructive">{errors.password.message}</p>
-        ) : null}
       </div>
-      {serverError ? <p className="text-sm text-destructive">{serverError}</p> : null}
-      <Button type="submit" size="lg" className="h-12 w-full rounded-2xl">
+      {state.message ? <p className="text-sm text-destructive">{state.message}</p> : null}
+      <Button type="submit" size="lg" className="h-12 w-full rounded-2xl" disabled={isPending}>
         {isPending ? "Signing in..." : "Sign in"}
       </Button>
     </form>

@@ -1,6 +1,6 @@
 import { PageHeader } from "@/components/layout/page-header";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { businessProfile } from "@/services/mock-data";
+import { BUSINESS_PROFILE } from "@/lib/constants";
 
 export default function SettingsPage() {
   return (
@@ -15,11 +15,11 @@ export default function SettingsPage() {
         <Card>
           <CardHeader><CardTitle>Business info</CardTitle></CardHeader>
           <CardContent className="space-y-2 text-sm text-muted-foreground">
-            <p>Name: {businessProfile.businessName}</p>
-            <p>Owner: {businessProfile.ownerName}</p>
-            <p>Phone: {businessProfile.phone}</p>
-            <p>Address: {businessProfile.address}</p>
-            <p>Service areas: {businessProfile.serviceAreas.join(", ")}</p>
+            <p>Name: {BUSINESS_PROFILE.businessName}</p>
+            <p>Owner: {BUSINESS_PROFILE.ownerName}</p>
+            <p>Phone: {BUSINESS_PROFILE.phone}</p>
+            <p>Address: {BUSINESS_PROFILE.address}</p>
+            <p>Service areas: {BUSINESS_PROFILE.serviceAreas.join(", ")}</p>
           </CardContent>
         </Card>
 
