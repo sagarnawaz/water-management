@@ -6,6 +6,7 @@ import { PageHeader } from "@/components/layout/page-header";
 import { StatusBadge } from "@/components/status-badge";
 import { buttonVariants } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { isDeliveryCompleted } from "@/lib/delivery-status";
 import { formatCurrency, formatDateTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { getOrder } from "@/services/data";
@@ -23,6 +24,8 @@ export default async function RiderDeliveryDetailPage({
   if (!detail || !detail.customer) {
     notFound();
   }
+
+  const isCompleted = isDeliveryCompleted(detail.deliveryRecord.status);
 
   return (
     <div className="space-y-6">
@@ -60,9 +63,11 @@ export default async function RiderDeliveryDetailPage({
               <MapPinned className="size-4" />
               Open location
             </a>
-            <Link href={`/rider/deliveries/${detail.order.id}/complete`} className={cn(buttonVariants({ size: "lg" }), "h-12 rounded-2xl justify-center")}>
-              Update delivery
-            </Link>
+            {isCompleted ? null : (
+              <Link href={`/rider/deliveries/${detail.order.id}/complete`} className={cn(buttonVariants({ size: "lg" }), "h-12 rounded-2xl justify-center")}>
+                Update delivery
+              </Link>
+            )}
           </div>
         </CardContent>
       </Card>

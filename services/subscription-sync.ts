@@ -4,6 +4,7 @@ import { endOfMonth, format, parseISO, startOfMonth } from "date-fns";
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 import { getScheduledDeliveryDateKeys } from "@/lib/customer-service";
+import { allocateMonthlyAmount, roundMoney } from "@/lib/money";
 import { createServiceRoleSupabaseClient } from "@/lib/supabase/admin";
 import type { PaymentMethod } from "@/types/domain";
 
@@ -31,6 +32,18 @@ type ExistingDeliveryRow = {
   status: string;
 };
 
+type SyncedDeliveryPayload = {
+  customer_id: string;
+  subscription_id: string;
+  rider_id: string | null;
+  scheduled_date: string;
+  scheduled_time_slot: string | null;
+  scheduled_bottles: number;
+  expected_amount: number;
+  due_amount: number;
+  updated_at: string;
+};
+
 function getPrivilegedClient(client?: SyncClient) {
   return client ?? createServiceRoleSupabaseClient();
 }
@@ -47,28 +60,23 @@ function getWindowDates(windowStart?: Date, windowEnd?: Date) {
   };
 }
 
-function getScheduledDaysInMonth(subscription: SubscriptionRow, scheduledDate: string) {
+function getMonthlyAmountMap(subscription: SubscriptionRow, scheduledDate: string) {
   const monthStart = startOfMonth(parseISO(`${scheduledDate}T00:00:00`));
   const monthEnd = endOfMonth(monthStart);
-
-  return getScheduledDeliveryDateKeys({
+  const scheduledDates = getScheduledDeliveryDateKeys({
     startDate: subscription.start_date,
     endDate: subscription.end_date,
     deliveryFrequency: subscription.delivery_frequency,
     deliveryDays: subscription.delivery_days ?? [],
     windowStart: monthStart,
     windowEnd: monthEnd,
-  }).length;
+  });
+
+  return allocateMonthlyAmount(subscription.monthly_amount, scheduledDates);
 }
 
 function getExpectedAmount(subscription: SubscriptionRow, scheduledDate: string) {
-  const scheduledDays = getScheduledDaysInMonth(subscription, scheduledDate);
-
-  if (scheduledDays <= 0) {
-    return 0;
-  }
-
-  return Number((subscription.monthly_amount / scheduledDays).toFixed(2));
+  return getMonthlyAmountMap(subscription, scheduledDate).get(scheduledDate) ?? 0;
 }
 
 function getInitialDueAmount(paymentMethod: PaymentMethod, expectedAmount: number) {
@@ -77,6 +85,81 @@ function getInitialDueAmount(paymentMethod: PaymentMethod, expectedAmount: numbe
   }
 
   return paymentMethod === "credit" ? expectedAmount : expectedAmount;
+}
+
+async function syncDeliveryLedgerEntries(
+  supabase: NonNullable<SyncClient>,
+  rows: Array<{
+    id: string;
+    customer_id: string;
+    subscription_id: string;
+    scheduled_date: string;
+    expected_amount: number;
+  }>,
+) {
+  await Promise.all(
+    rows.map(async (row) => {
+      const { data: existingLedgers, error: existingLedgerError } = await supabase
+        .from("ledger_entries")
+        .select("id")
+        .eq("delivery_record_id", row.id)
+        .eq("entry_type", "delivery")
+        .order("created_at", { ascending: true });
+
+      if (existingLedgerError) {
+        throw existingLedgerError;
+      }
+
+      const payload = {
+        customer_id: row.customer_id,
+        subscription_id: row.subscription_id,
+        delivery_record_id: row.id,
+        entry_type: "delivery",
+        debit: roundMoney(Number(row.expected_amount)),
+        credit: 0,
+        description: `Scheduled delivery for ${row.scheduled_date}`,
+      };
+
+      const [primaryLedger, ...duplicateLedgers] = existingLedgers ?? [];
+
+      if (primaryLedger?.id) {
+        const { error } = await supabase
+          .from("ledger_entries")
+          .update(payload)
+          .eq("id", primaryLedger.id);
+
+        if (error) {
+          throw error;
+        }
+
+        if (duplicateLedgers.length > 0) {
+          const { error: duplicateUpdateError } = await supabase
+            .from("ledger_entries")
+            .update({
+              debit: 0,
+              credit: 0,
+              balance_snapshot: null,
+              description: `Duplicate delivery entry neutralized for ${row.scheduled_date}`,
+            })
+            .in(
+              "id",
+              duplicateLedgers.map((ledger) => ledger.id),
+            );
+
+          if (duplicateUpdateError) {
+            throw duplicateUpdateError;
+          }
+        }
+
+        return;
+      }
+
+      const { error } = await supabase.from("ledger_entries").insert(payload);
+      if (error) {
+        throw error;
+      }
+    }),
+  );
 }
 
 export async function syncSubscriptionDeliveries(options?: {
@@ -156,7 +239,7 @@ export async function syncSubscriptionDeliveries(options?: {
   );
 
   const inserts: Array<Record<string, unknown>> = [];
-  const updates: Array<Record<string, unknown>> = [];
+  const updates: Array<SyncedDeliveryPayload & { id: string }> = [];
 
   for (const subscription of subscriptions) {
     const scheduledDates = getScheduledDeliveryDateKeys({
@@ -167,10 +250,11 @@ export async function syncSubscriptionDeliveries(options?: {
       windowStart: start,
       windowEnd: end,
     });
+    const amountByDate = allocateMonthlyAmount(subscription.monthly_amount, scheduledDates);
 
     for (const scheduledDate of scheduledDates) {
       const existing = existingMap.get(`${subscription.id}:${scheduledDate}`);
-      const expectedAmount = getExpectedAmount(subscription, scheduledDate);
+      const expectedAmount = amountByDate.get(scheduledDate) ?? getExpectedAmount(subscription, scheduledDate);
       const basePayload = {
         customer_id: subscription.customer_id,
         subscription_id: subscription.id,
@@ -178,8 +262,8 @@ export async function syncSubscriptionDeliveries(options?: {
         scheduled_date: scheduledDate,
         scheduled_time_slot: subscription.preferred_time_slot,
         scheduled_bottles: subscription.bottles_per_delivery,
-        expected_amount: expectedAmount,
-        due_amount: getInitialDueAmount(subscription.payment_method, expectedAmount),
+        expected_amount: roundMoney(expectedAmount),
+        due_amount: getInitialDueAmount(subscription.payment_method, roundMoney(expectedAmount)),
         updated_at: new Date().toISOString(),
       };
 
@@ -216,20 +300,7 @@ export async function syncSubscriptionDeliveries(options?: {
     }
 
     if ((insertedRows ?? []).length > 0) {
-      const ledgerRows = (insertedRows ?? []).map((row) => ({
-        customer_id: row.customer_id,
-        subscription_id: row.subscription_id,
-        delivery_record_id: row.id,
-        entry_type: "delivery",
-        debit: row.expected_amount,
-        credit: 0,
-        description: `Scheduled delivery for ${row.scheduled_date}`,
-      }));
-
-      const { error: ledgerError } = await supabase.from("ledger_entries").insert(ledgerRows);
-      if (ledgerError) {
-        throw ledgerError;
-      }
+      await syncDeliveryLedgerEntries(supabase, insertedRows ?? []);
     }
   }
 
@@ -248,6 +319,22 @@ export async function syncSubscriptionDeliveries(options?: {
         .eq("id", String(row.id)),
     ),
   );
+
+  if (updates.length > 0) {
+    const { data: updatedRows, error } = await supabase
+      .from("delivery_records")
+      .select("id, customer_id, subscription_id, scheduled_date, expected_amount")
+      .in(
+        "id",
+        updates.map((row) => row.id),
+      );
+
+    if (error) {
+      throw error;
+    }
+
+    await syncDeliveryLedgerEntries(supabase, updatedRows ?? []);
+  }
 }
 
 export async function cancelUpcomingDeliveryRecordsForCustomer(

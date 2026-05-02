@@ -131,7 +131,7 @@ export function SubscriptionForm({
 
           <div className="space-y-2">
             <Label htmlFor="bottlesPerDelivery">Bottles per delivery</Label>
-            <Input id="bottlesPerDelivery" type="number" min="1" {...register("bottlesPerDelivery")} />
+            <Input id="bottlesPerDelivery" type="number" min="1" step="1" {...register("bottlesPerDelivery")} />
             {errors.bottlesPerDelivery ? (
               <p className="text-sm text-destructive">{errors.bottlesPerDelivery.message}</p>
             ) : null}
@@ -178,7 +178,7 @@ export function SubscriptionForm({
 
           <div className="space-y-2">
             <Label htmlFor="monthlyAmount">Monthly amount</Label>
-            <Input id="monthlyAmount" type="number" min="0" {...register("monthlyAmount")} />
+            <Input id="monthlyAmount" type="number" min="0" step="1" {...register("monthlyAmount")} />
             {errors.monthlyAmount ? (
               <p className="text-sm text-destructive">{errors.monthlyAmount.message}</p>
             ) : null}

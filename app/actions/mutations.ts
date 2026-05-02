@@ -4,6 +4,8 @@ import { Buffer } from "node:buffer";
 import { revalidatePath } from "next/cache";
 
 import { requireUser } from "@/lib/auth/session";
+import { roundMoney } from "@/lib/money";
+import { createServiceRoleSupabaseClient } from "@/lib/supabase/admin";
 import { createServerSupabaseClient } from "@/lib/supabase/server";
 import {
   syncSubscriptionDeliveries,
@@ -30,7 +32,19 @@ function buildMutationResult(path: string, message: string): MutationResult {
 }
 
 function roundAmount(value: number) {
-  return Number(value.toFixed(2));
+  return roundMoney(value);
+}
+
+async function insertLedgerEntry(
+  supabase: Awaited<ReturnType<typeof createServerSupabaseClient>>,
+  payload: Record<string, unknown>,
+) {
+  const ledgerClient = createServiceRoleSupabaseClient() ?? supabase;
+  const { error } = await ledgerClient.from("ledger_entries").insert(payload);
+
+  if (error) {
+    throw error;
+  }
 }
 
 async function uploadOptionalProof(file: File | null) {
@@ -93,6 +107,10 @@ export async function saveCustomerAction(input: CustomerInput): Promise<Mutation
       message:
         parsed.error.flatten().fieldErrors.name?.[0] ??
         parsed.error.flatten().fieldErrors.phone?.[0] ??
+        parsed.error.flatten().fieldErrors.alternatePhone?.[0] ??
+        parsed.error.flatten().fieldErrors.area?.[0] ??
+        parsed.error.flatten().fieldErrors.address?.[0] ??
+        parsed.error.flatten().fieldErrors.notes?.[0] ??
         "Please check the customer form.",
     };
   }
@@ -154,7 +172,7 @@ export async function saveSubscriptionAction(
     delivery_frequency: parsed.data.deliveryFrequency,
     delivery_days: parsed.data.deliveryDays,
     preferred_time_slot: parsed.data.preferredTimeSlot || null,
-    monthly_amount: parsed.data.monthlyAmount,
+    monthly_amount: roundMoney(parsed.data.monthlyAmount),
     payment_method: parsed.data.paymentMethod,
     billing_cycle: parsed.data.billingCycle,
     start_date: parsed.data.startDate,
@@ -363,12 +381,30 @@ export async function reviewPaymentAction(
     throw updateError;
   }
 
-  if (payment?.delivery_record_id) {
+  if (payment?.delivery_record_id && decision === "verified") {
+    const { data: deliveryRecord, error: deliveryFetchError } = await supabase
+      .from("delivery_records")
+      .select("collected_amount, due_amount")
+      .eq("id", payment.delivery_record_id)
+      .maybeSingle();
+
+    if (deliveryFetchError) {
+      throw deliveryFetchError;
+    }
+
+    const paymentAmount = roundMoney(Number(payment.amount));
+    const collectedAmount = roundMoney(
+      Number(deliveryRecord?.collected_amount ?? 0) + paymentAmount,
+    );
+    const dueAmount = roundMoney(
+      Math.max(Number(deliveryRecord?.due_amount ?? 0) - paymentAmount, 0),
+    );
+
     const { error: deliveryError } = await supabase
       .from("delivery_records")
       .update({
-        collected_amount: decision === "verified" ? Number(payment.amount) : 0,
-        due_amount: decision === "verified" ? 0 : Number(payment.amount),
+        collected_amount: collectedAmount,
+        due_amount: dueAmount,
         updated_at: new Date().toISOString(),
       })
       .eq("id", payment.delivery_record_id);
@@ -377,22 +413,16 @@ export async function reviewPaymentAction(
       throw deliveryError;
     }
 
-    if (decision === "verified") {
-      const { error: ledgerError } = await supabase.from("ledger_entries").insert({
-        customer_id: payment.customer_id,
-        subscription_id: payment.subscription_id,
-        delivery_record_id: payment.delivery_record_id,
-        payment_id: payment.id,
-        entry_type: "payment",
-        debit: 0,
-        credit: Number(payment.amount),
-        description: "Verified online payment",
-      });
-
-      if (ledgerError) {
-        throw ledgerError;
-      }
-    }
+    await insertLedgerEntry(supabase, {
+      customer_id: payment.customer_id,
+      subscription_id: payment.subscription_id,
+      delivery_record_id: payment.delivery_record_id,
+      payment_id: payment.id,
+      entry_type: "payment",
+      debit: 0,
+      credit: paymentAmount,
+      description: "Verified online payment",
+    });
   }
 
   revalidatePath("/admin/payments");
@@ -418,6 +448,7 @@ export async function saveManualPaymentAction(
   const supabase = await createServerSupabaseClient();
   const paymentStatus =
     parsed.data.paymentMethod === "cash" ? "verified" : "pending_verification";
+  const paymentAmount = roundMoney(parsed.data.amount);
 
   const { data: payment, error: paymentError } = await supabase
     .from("payments")
@@ -426,7 +457,7 @@ export async function saveManualPaymentAction(
       subscription_id: parsed.data.subscriptionId || null,
       delivery_record_id: parsed.data.deliveryRecordId || null,
       rider_id: parsed.data.riderId || null,
-      amount: parsed.data.amount,
+      amount: paymentAmount,
       payment_method: parsed.data.paymentMethod,
       payment_status: paymentStatus,
       transaction_reference: parsed.data.transactionReference || null,
@@ -451,8 +482,12 @@ export async function saveManualPaymentAction(
       throw deliveryFetchError;
     }
 
-    const collectedAmount = Number(deliveryRecord?.collected_amount ?? 0) + parsed.data.amount;
-    const dueAmount = Math.max(Number(deliveryRecord?.due_amount ?? 0) - parsed.data.amount, 0);
+    const collectedAmount = roundMoney(
+      Number(deliveryRecord?.collected_amount ?? 0) + paymentAmount,
+    );
+    const dueAmount = roundMoney(
+      Math.max(Number(deliveryRecord?.due_amount ?? 0) - paymentAmount, 0),
+    );
 
     const { error: deliveryUpdateError } = await supabase
       .from("delivery_records")
@@ -468,19 +503,17 @@ export async function saveManualPaymentAction(
     }
   }
 
-  const { error: ledgerError } = await supabase.from("ledger_entries").insert({
-    customer_id: parsed.data.customerId,
-    subscription_id: parsed.data.subscriptionId || null,
-    delivery_record_id: parsed.data.deliveryRecordId || null,
-    payment_id: payment?.id,
-    entry_type: "payment",
-    debit: 0,
-    credit: parsed.data.amount,
-    description: "Manual payment entry",
-  });
-
-  if (ledgerError) {
-    throw ledgerError;
+  if (paymentStatus === "verified") {
+    await insertLedgerEntry(supabase, {
+      customer_id: parsed.data.customerId,
+      subscription_id: parsed.data.subscriptionId || null,
+      delivery_record_id: parsed.data.deliveryRecordId || null,
+      payment_id: payment?.id,
+      entry_type: "payment",
+      debit: 0,
+      credit: paymentAmount,
+      description: "Manual payment entry",
+    });
   }
 
   revalidatePath("/admin/payments");
@@ -531,7 +564,7 @@ export async function markDeliveryAction(formData: FormData): Promise<MutationRe
 
   const proof = formData.get("proof");
   const proofUpload = await uploadOptionalProof(proof instanceof File ? proof : null);
-  const expectedAmount = Number(currentRecord.expected_amount ?? 0);
+  const expectedAmount = roundMoney(Number(currentRecord.expected_amount ?? 0));
   const scheduledBottles = Number(currentRecord.scheduled_bottles ?? 0);
   const chargeAmount = getChargeAmount({
     status: parsed.data.status,
@@ -572,11 +605,11 @@ export async function markDeliveryAction(formData: FormData): Promise<MutationRe
       ? 0
       : parsed.data.paymentOutcome === "credit_due"
         ? 0
-        : parsed.data.amountReceived || 0;
+        : roundMoney(parsed.data.amountReceived || 0);
   const remainingDue =
     parsed.data.paymentOutcome === "online_claimed"
       ? chargeAmount
-      : Math.max(chargeAmount - collectedAmount, 0);
+      : roundMoney(Math.max(chargeAmount - collectedAmount, 0));
 
   const { error: updateError } = await supabase
     .from("delivery_records")
@@ -606,10 +639,10 @@ export async function markDeliveryAction(formData: FormData): Promise<MutationRe
     throw updateError;
   }
 
-  const adjustmentAmount = Math.max(expectedAmount - chargeAmount, 0);
+  const adjustmentAmount = roundMoney(Math.max(expectedAmount - chargeAmount, 0));
 
   if (adjustmentAmount > 0) {
-    const { error: adjustmentError } = await supabase.from("ledger_entries").insert({
+    await insertLedgerEntry(supabase, {
       customer_id: currentRecord.customer_id,
       subscription_id: currentRecord.subscription_id,
       delivery_record_id: currentRecord.id,
@@ -618,10 +651,6 @@ export async function markDeliveryAction(formData: FormData): Promise<MutationRe
       credit: adjustmentAmount,
       description: "Delivery adjustment",
     });
-
-    if (adjustmentError) {
-      throw adjustmentError;
-    }
   }
 
   if (
@@ -662,7 +691,7 @@ export async function markDeliveryAction(formData: FormData): Promise<MutationRe
     }
 
     if (parsed.data.paymentOutcome !== "online_claimed") {
-      const { error: ledgerError } = await supabase.from("ledger_entries").insert({
+      await insertLedgerEntry(supabase, {
         customer_id: currentRecord.customer_id,
         subscription_id: currentRecord.subscription_id,
         delivery_record_id: parsed.data.deliveryRecordId,
@@ -672,10 +701,6 @@ export async function markDeliveryAction(formData: FormData): Promise<MutationRe
         credit: paymentAmount,
         description: "Delivery collection",
       });
-
-      if (ledgerError) {
-        throw ledgerError;
-      }
     }
   }
 

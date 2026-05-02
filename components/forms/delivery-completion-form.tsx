@@ -54,8 +54,8 @@ export function DeliveryCompletionForm({
 
   const paymentOutcome = useWatch({ control, name: "paymentOutcome" });
   const status = useWatch({ control, name: "status" });
-  const amountReceived = Number(useWatch({ control, name: "amountReceived" }) || 0);
-  const remainingDue = Math.max(deliveryRecord.expectedAmount - amountReceived, 0);
+  const amountReceived = Math.round(Number(useWatch({ control, name: "amountReceived" }) || 0));
+  const remainingDue = Math.max(Math.round(deliveryRecord.expectedAmount) - amountReceived, 0);
 
   const onSubmit = handleSubmit((values) => {
     const formData = new FormData();
@@ -102,7 +102,7 @@ export function DeliveryCompletionForm({
 
           <div className="space-y-2">
             <Label htmlFor="deliveredQty">Delivered bottles</Label>
-            <Input id="deliveredQty" type="number" min="0" {...register("deliveredQty")} />
+            <Input id="deliveredQty" type="number" min="0" step="1" {...register("deliveredQty")} />
             {errors.deliveredQty ? (
               <p className="text-sm text-destructive">{errors.deliveredQty.message}</p>
             ) : null}
@@ -128,7 +128,7 @@ export function DeliveryCompletionForm({
           {(paymentOutcome === "cash_received" || paymentOutcome === "partial_payment") ? (
             <div className="space-y-2">
               <Label htmlFor="amountReceived">Amount received</Label>
-              <Input id="amountReceived" type="number" min="0" {...register("amountReceived")} />
+              <Input id="amountReceived" type="number" min="0" step="1" {...register("amountReceived")} />
               {errors.amountReceived ? (
                 <p className="text-sm text-destructive">{errors.amountReceived.message}</p>
               ) : null}

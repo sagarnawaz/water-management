@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import { paymentMethodOptions } from "@/lib/constants";
+import { roundMoney } from "@/lib/money";
 
 const paymentMethods = paymentMethodOptions.map((item) => item.value) as [
   string,
@@ -16,7 +17,7 @@ export const subscriptionSchema = z
     deliveryFrequency: z.enum(["daily", "weekdays", "custom_days"]),
     deliveryDays: z.array(z.coerce.number().min(0).max(6)).default([]),
     preferredTimeSlot: z.string().optional(),
-    monthlyAmount: z.coerce.number().min(0, "Monthly amount is required"),
+    monthlyAmount: z.coerce.number().min(0, "Monthly amount is required").transform(roundMoney),
     paymentMethod: z.enum(paymentMethods),
     billingCycle: z.enum(["monthly"]).default("monthly"),
     startDate: z.string().min(1, "Start date is required"),

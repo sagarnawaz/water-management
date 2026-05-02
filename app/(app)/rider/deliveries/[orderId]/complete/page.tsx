@@ -1,7 +1,8 @@
-import { notFound } from "next/navigation";
+import { notFound, redirect } from "next/navigation";
 
 import { DeliveryCompletionForm } from "@/components/forms/delivery-completion-form";
 import { PageHeader } from "@/components/layout/page-header";
+import { isDeliveryCompleted } from "@/lib/delivery-status";
 import { getOrder } from "@/services/data";
 
 type DeliveryCompleteProps = {
@@ -14,6 +15,10 @@ export default async function DeliveryCompletePage({ params }: DeliveryCompleteP
 
   if (!detail || !detail.customer) {
     notFound();
+  }
+
+  if (isDeliveryCompleted(detail.deliveryRecord.status)) {
+    redirect(`/rider/deliveries/${detail.order.id}`);
   }
 
   return (

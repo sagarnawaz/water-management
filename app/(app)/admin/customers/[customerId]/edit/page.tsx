@@ -2,7 +2,8 @@ import { notFound } from "next/navigation";
 
 import { CustomerForm } from "@/components/forms/customer-form";
 import { PageHeader } from "@/components/layout/page-header";
-import { getCustomer, listRiders } from "@/services/data";
+import { BUSINESS_PROFILE } from "@/lib/constants";
+import { getAreas, getCustomer, listRiders } from "@/services/data";
 
 type EditCustomerProps = {
   params: Promise<{ customerId: string }>;
@@ -10,11 +11,17 @@ type EditCustomerProps = {
 
 export default async function EditCustomerPage({ params }: EditCustomerProps) {
   const { customerId } = await params;
-  const [detail, riders] = await Promise.all([getCustomer(customerId), listRiders()]);
+  const [detail, riders, areas] = await Promise.all([
+    getCustomer(customerId),
+    listRiders(),
+    getAreas(),
+  ]);
 
   if (!detail) {
     notFound();
   }
+
+  const areaOptions = Array.from(new Set([...BUSINESS_PROFILE.serviceAreas, ...areas])).sort();
 
   return (
     <div className="space-y-6">
@@ -23,7 +30,7 @@ export default async function EditCustomerPage({ params }: EditCustomerProps) {
         title={`Edit ${detail.customer.name}`}
         description="Update customer contact details and status without affecting delivery history."
       />
-      <CustomerForm customer={detail.customer} riders={riders} />
+      <CustomerForm customer={detail.customer} riders={riders} areaOptions={areaOptions} />
     </div>
   );
 }

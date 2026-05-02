@@ -3,6 +3,7 @@ import "server-only";
 import { cache } from "react";
 import { format, isSameDay, parseISO, startOfDay, startOfMonth, startOfWeek } from "date-fns";
 
+import { roundMoney, sumMoney } from "@/lib/money";
 import { createServerSupabaseClient } from "@/lib/supabase/server";
 import { syncSubscriptionDeliveries } from "@/services/subscription-sync";
 import type {
@@ -24,6 +25,21 @@ import type {
 
 const todayDate = () => startOfDay(new Date());
 const SUBSCRIPTION_SYNC_WINDOW_MS = 5 * 60 * 1000;
+
+function isCompletedDeliveryStatus(status: DeliveryRecordStatus) {
+  return status === "delivered" || status === "partially_delivered";
+}
+
+function isVisibleRiderDelivery(delivery: DeliveryRecord, todayKey: string) {
+  return (
+    delivery.scheduledDate === todayKey ||
+    (delivery.scheduledDate < todayKey && !isCompletedDeliveryStatus(delivery.status))
+  );
+}
+
+function isConfirmedPayment(payment: Payment) {
+  return payment.paymentStatus === "verified" || payment.paymentStatus === "received";
+}
 
 const CUSTOMER_SELECT = [
   "id",
@@ -120,6 +136,10 @@ const LEDGER_SELECT = [
   "created_at",
 ].join(", ");
 
+function isPermissionDeniedError(error: { code?: string } | null) {
+  return error?.code === "42501";
+}
+
 let lastSubscriptionSyncAt = 0;
 let subscriptionSyncPromise: Promise<void> | null = null;
 
@@ -146,6 +166,10 @@ function toNumber(value: unknown) {
   }
 
   return 0;
+}
+
+function toMoney(value: unknown) {
+  return roundMoney(toNumber(value));
 }
 
 function mapCustomer(row: Record<string, unknown>): Customer {
@@ -185,7 +209,7 @@ function mapSubscription(row: Record<string, unknown>): Subscription {
       ? row.delivery_days.map((value) => toNumber(value))
       : [],
     preferredTimeSlot: row.preferred_time_slot ? String(row.preferred_time_slot) : undefined,
-    monthlyAmount: toNumber(row.monthly_amount),
+    monthlyAmount: toMoney(row.monthly_amount),
     paymentMethod: String(row.payment_method ?? "cash") as PaymentMethod,
     billingCycle: String(row.billing_cycle ?? "monthly") as Subscription["billingCycle"],
     startDate: String(row.start_date ?? format(new Date(), "yyyy-MM-dd")),
@@ -210,9 +234,9 @@ function mapDeliveryRecord(row: Record<string, unknown>, customer?: Customer): D
         ? undefined
         : toNumber(row.delivered_bottles),
     status: String(row.status ?? "scheduled") as DeliveryRecordStatus,
-    expectedAmount: toNumber(row.expected_amount),
-    collectedAmount: toNumber(row.collected_amount),
-    dueAmount: toNumber(row.due_amount),
+    expectedAmount: toMoney(row.expected_amount),
+    collectedAmount: toMoney(row.collected_amount),
+    dueAmount: toMoney(row.due_amount),
     deliveredAt: row.delivered_at ? String(row.delivered_at) : undefined,
     transactionReference: row.transaction_reference
       ? String(row.transaction_reference)
@@ -236,7 +260,7 @@ function mapPayment(row: Record<string, unknown>): Payment {
     deliveryRecordId,
     orderId: legacyOrderId ?? deliveryRecordId,
     riderId: row.rider_id ? String(row.rider_id) : undefined,
-    amount: toNumber(row.amount),
+    amount: toMoney(row.amount),
     paymentMethod: String(row.payment_method ?? "cash") as PaymentMethod,
     paymentStatus: String(row.payment_status ?? "received") as PaymentRecordStatus,
     transactionReference: row.transaction_reference
@@ -262,12 +286,12 @@ function mapLedger(row: Record<string, unknown>): LedgerEntry {
     orderId: legacyOrderId ?? deliveryRecordId,
     paymentId: row.payment_id ? String(row.payment_id) : undefined,
     entryType: String(row.entry_type ?? "adjustment") as LedgerEntry["entryType"],
-    debit: toNumber(row.debit),
-    credit: toNumber(row.credit),
+    debit: toMoney(row.debit),
+    credit: toMoney(row.credit),
     balanceSnapshot:
       row.balance_snapshot === null || row.balance_snapshot === undefined
         ? 0
-        : toNumber(row.balance_snapshot),
+        : toMoney(row.balance_snapshot),
     description: String(row.description ?? ""),
     createdAt: String(row.created_at ?? new Date().toISOString()),
   };
@@ -279,12 +303,12 @@ function computeRunningLedger(entries: LedgerEntry[]) {
   return [...entries]
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
     .map((entry) => {
-      runningBalance += entry.debit - entry.credit;
+      runningBalance = roundMoney(runningBalance + entry.debit - entry.credit);
       return {
         ...entry,
         balanceSnapshot:
           entry.balanceSnapshot && entry.balanceSnapshot !== 0
-            ? entry.balanceSnapshot
+            ? roundMoney(entry.balanceSnapshot)
             : runningBalance,
       };
     });
@@ -576,7 +600,7 @@ export async function listCustomerSummaries(query?: string) {
       totalPaid: 0,
       activeSubscriptions: 0,
     };
-    totals.totalDeliveries += delivery.expectedAmount;
+    totals.totalDeliveries = roundMoney(totals.totalDeliveries + delivery.expectedAmount);
     totalsByCustomer.set(delivery.customerId, totals);
   }
 
@@ -586,7 +610,9 @@ export async function listCustomerSummaries(query?: string) {
       totalPaid: 0,
       activeSubscriptions: 0,
     };
-    totals.totalPaid += payment.amount;
+    if (isConfirmedPayment(payment)) {
+      totals.totalPaid = roundMoney(totals.totalPaid + payment.amount);
+    }
     totalsByCustomer.set(payment.customerId, totals);
   }
 
@@ -614,9 +640,9 @@ export async function listCustomerSummaries(query?: string) {
     return {
       customer,
       totals: {
-        totalOrders: totals.totalDeliveries,
-        totalPaid: totals.totalPaid,
-        currentDue: Math.max(totals.totalDeliveries - totals.totalPaid, 0),
+        totalOrders: roundMoney(totals.totalDeliveries),
+        totalPaid: roundMoney(totals.totalPaid),
+        currentDue: roundMoney(Math.max(totals.totalDeliveries - totals.totalPaid, 0)),
         activeSubscriptions: totals.activeSubscriptions,
       },
     };
@@ -757,8 +783,8 @@ export async function getCustomer(id: string) {
     (ledgerResult.data ?? []).map((row) => mapLedger(row as Record<string, unknown>)),
   );
   const activeSubscriptions = subscriptions.filter((subscription) => subscription.status === "active");
-  const totalScheduledValue = deliveryRecords.reduce((sum, delivery) => sum + delivery.expectedAmount, 0);
-  const totalPaid = payments.reduce((sum, payment) => sum + payment.amount, 0);
+  const totalScheduledValue = sumMoney(deliveryRecords.map((delivery) => delivery.expectedAmount));
+  const totalPaid = sumMoney(payments.filter(isConfirmedPayment).map((payment) => payment.amount));
 
   return {
     customer,
@@ -771,7 +797,7 @@ export async function getCustomer(id: string) {
     totals: {
       totalOrders: totalScheduledValue,
       totalPaid,
-      currentDue: Math.max(totalScheduledValue - totalPaid, 0),
+      currentDue: roundMoney(Math.max(totalScheduledValue - totalPaid, 0)),
     },
   };
 }
@@ -924,11 +950,11 @@ export async function getRider(id: string) {
         .length,
       deliveredOrders: deliveredOrders.length,
       totalCollectedCash: payments
-        .filter((payment) => payment.paymentMethod === "cash")
-        .reduce((sum, payment) => sum + payment.amount, 0),
+        .filter((payment) => payment.paymentMethod === "cash" && isConfirmedPayment(payment))
+        .reduce((sum, payment) => roundMoney(sum + payment.amount), 0),
       pendingReconciliation: payments
         .filter((payment) => payment.paymentStatus === "pending_verification")
-        .reduce((sum, payment) => sum + payment.amount, 0),
+        .reduce((sum, payment) => roundMoney(sum + payment.amount), 0),
     },
   };
 }
@@ -997,7 +1023,7 @@ export async function getOrder(id: string) {
     throw paymentsResult.error;
   }
 
-  if (ledgerResult.error) {
+  if (ledgerResult.error && !isPermissionDeniedError(ledgerResult.error)) {
     throw ledgerResult.error;
   }
 
@@ -1074,14 +1100,15 @@ export async function getAdminDashboardData() {
     todayOrdersCount: todayOrders.length,
     deliveredOrdersCount: deliveredToday.length,
     pendingPaymentsCount: pendingVerification.length,
-    totalDue: deliveries.reduce((sum, delivery) => sum + delivery.dueAmount, 0),
+    totalDue: sumMoney(deliveries.map((delivery) => delivery.dueAmount)),
     cashCollectedToday: payments
       .filter(
         (payment) =>
           payment.paymentMethod === "cash" &&
+          isConfirmedPayment(payment) &&
           isSameDay(parseISO(payment.receivedAt), todayDate()),
       )
-      .reduce((sum, payment) => sum + payment.amount, 0),
+      .reduce((sum, payment) => roundMoney(sum + payment.amount), 0),
     recentOrders: [...orders]
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
       .slice(0, 4)
@@ -1109,14 +1136,14 @@ export async function getAdminDashboardData() {
         riderId: rider.id,
         riderName: rider.name,
         cashCollected: riderPayments
-          .filter((payment) => payment.paymentMethod === "cash")
-          .reduce((sum, payment) => sum + payment.amount, 0),
+          .filter((payment) => payment.paymentMethod === "cash" && isConfirmedPayment(payment))
+          .reduce((sum, payment) => roundMoney(sum + payment.amount), 0),
         onlineClaimed: riderPayments
           .filter((payment) => payment.paymentMethod !== "cash")
-          .reduce((sum, payment) => sum + payment.amount, 0),
+          .reduce((sum, payment) => roundMoney(sum + payment.amount), 0),
         pendingReconciliation: riderPayments
           .filter((payment) => payment.paymentStatus === "pending_verification")
-          .reduce((sum, payment) => sum + payment.amount, 0),
+          .reduce((sum, payment) => roundMoney(sum + payment.amount), 0),
         completedDeliveries,
         missedDeliveries,
         deliveredCount: completedDeliveries,
@@ -1286,12 +1313,12 @@ export async function getReportSummary(
       delivery.status === "delivered" || delivery.status === "partially_delivered",
     ).length,
     cashCollected: filteredPayments
-      .filter((payment) => payment.paymentMethod === "cash")
-      .reduce((sum, payment) => sum + payment.amount, 0),
+      .filter((payment) => payment.paymentMethod === "cash" && isConfirmedPayment(payment))
+      .reduce((sum, payment) => roundMoney(sum + payment.amount), 0),
     pendingVerification: filteredPayments
       .filter((payment) => payment.paymentStatus === "pending_verification")
-      .reduce((sum, payment) => sum + payment.amount, 0),
-    totalDue: filteredDeliveries.reduce((sum, delivery) => sum + delivery.dueAmount, 0),
+      .reduce((sum, payment) => roundMoney(sum + payment.amount), 0),
+    totalDue: sumMoney(filteredDeliveries.map((delivery) => delivery.dueAmount)),
     riderWiseCollection: riders
       .filter((rider) => !filters?.rider || filters.rider === "all" || rider.id === filters.rider)
       .map<RiderCollectionSummary>((rider) => {
@@ -1305,14 +1332,14 @@ export async function getReportSummary(
           riderId: rider.id,
           riderName: rider.name,
           cashCollected: riderPayments
-            .filter((payment) => payment.paymentMethod === "cash")
-            .reduce((sum, payment) => sum + payment.amount, 0),
+            .filter((payment) => payment.paymentMethod === "cash" && isConfirmedPayment(payment))
+            .reduce((sum, payment) => roundMoney(sum + payment.amount), 0),
           onlineClaimed: riderPayments
             .filter((payment) => payment.paymentMethod !== "cash")
-            .reduce((sum, payment) => sum + payment.amount, 0),
+            .reduce((sum, payment) => roundMoney(sum + payment.amount), 0),
           pendingReconciliation: riderPayments
             .filter((payment) => payment.paymentStatus === "pending_verification")
-            .reduce((sum, payment) => sum + payment.amount, 0),
+            .reduce((sum, payment) => roundMoney(sum + payment.amount), 0),
           completedDeliveries,
           missedDeliveries: riderDeliveries.filter(
             (delivery) => delivery.status === "not_delivered" || delivery.status === "skipped",
@@ -1326,6 +1353,7 @@ export async function getReportSummary(
 
 export async function getRiderDashboard(user: SessionUser) {
   const effectiveRiderId = await resolveEffectiveRiderId(user);
+  const todayKey = format(new Date(), "yyyy-MM-dd");
 
   if (!effectiveRiderId) {
     return {
@@ -1346,8 +1374,8 @@ export async function getRiderDashboard(user: SessionUser) {
       .from("delivery_records")
       .select(DELIVERY_SELECT)
       .eq("rider_id", effectiveRiderId)
-      .eq("scheduled_date", format(new Date(), "yyyy-MM-dd"))
-      .order("scheduled_date", { ascending: true }),
+      .lte("scheduled_date", todayKey)
+      .order("scheduled_date", { ascending: false }),
     supabase
       .from("payments")
       .select(PAYMENT_SELECT)
@@ -1369,9 +1397,9 @@ export async function getRiderDashboard(user: SessionUser) {
   }
 
   const rider = riderResult.data ? mapRider(riderResult.data as Record<string, unknown>) : undefined;
-  const deliveryRecords = (deliveriesResult.data ?? []).map((row) =>
-    mapDeliveryRecord(row as Record<string, unknown>),
-  );
+  const deliveryRecords = (deliveriesResult.data ?? [])
+    .map((row) => mapDeliveryRecord(row as Record<string, unknown>))
+    .filter((delivery) => isVisibleRiderDelivery(delivery, todayKey));
   const payments = (paymentsResult.data ?? []).map((row) => mapPayment(row as Record<string, unknown>));
   const paymentsByDelivery = new Map<string, Payment[]>();
 
@@ -1405,22 +1433,23 @@ export async function getRiderDashboard(user: SessionUser) {
     rider,
     todayDeliveriesCount: deliveries.length,
     pendingDeliveriesCount: deliveries.filter(
-      ({ deliveryRecord }) =>
-        deliveryRecord.status !== "delivered" && deliveryRecord.status !== "partially_delivered",
+      ({ deliveryRecord }) => !isCompletedDeliveryStatus(deliveryRecord.status),
     ).length,
     cashCollectedToday: payments
       .filter(
         (payment) =>
           payment.paymentMethod === "cash" &&
+          isConfirmedPayment(payment) &&
           isSameDay(parseISO(payment.receivedAt), todayDate()),
       )
-      .reduce((sum, payment) => sum + payment.amount, 0),
+      .reduce((sum, payment) => roundMoney(sum + payment.amount), 0),
     deliveries,
   };
 }
 
 export async function getRiderDeliveries(user: SessionUser) {
   const effectiveRiderId = await resolveEffectiveRiderId(user);
+  const todayKey = format(new Date(), "yyyy-MM-dd");
 
   if (!effectiveRiderId) {
     return {
@@ -1438,7 +1467,8 @@ export async function getRiderDeliveries(user: SessionUser) {
       .from("delivery_records")
       .select(DELIVERY_SELECT)
       .eq("rider_id", effectiveRiderId)
-      .order("scheduled_date", { ascending: true }),
+      .lte("scheduled_date", todayKey)
+      .order("scheduled_date", { ascending: false }),
     getAllSubscriptions(),
     getAllPayments(),
   ]);
@@ -1447,9 +1477,9 @@ export async function getRiderDeliveries(user: SessionUser) {
     throw deliveriesResult.error;
   }
 
-  const deliveryRecords = (deliveriesResult.data ?? []).map((row) =>
-    mapDeliveryRecord(row as Record<string, unknown>),
-  );
+  const deliveryRecords = (deliveriesResult.data ?? [])
+    .map((row) => mapDeliveryRecord(row as Record<string, unknown>))
+    .filter((delivery) => isVisibleRiderDelivery(delivery, todayKey));
   const customers = await fetchCustomersByIds(
     Array.from(new Set(deliveryRecords.map((delivery) => delivery.customerId))),
   );
@@ -1482,12 +1512,10 @@ export async function getRiderDeliveries(user: SessionUser) {
     items,
     totalCount: items.length,
     pendingCount: items.filter(
-      ({ deliveryRecord }) =>
-        deliveryRecord.status !== "delivered" && deliveryRecord.status !== "partially_delivered",
+      ({ deliveryRecord }) => !isCompletedDeliveryStatus(deliveryRecord.status),
     ).length,
     deliveredCount: items.filter(
-      ({ deliveryRecord }) =>
-        deliveryRecord.status === "delivered" || deliveryRecord.status === "partially_delivered",
+      ({ deliveryRecord }) => isCompletedDeliveryStatus(deliveryRecord.status),
     ).length,
   };
 }
@@ -1556,13 +1584,16 @@ export async function getRiderCollections(user: SessionUser) {
       .filter(
         (payment) =>
           payment.paymentMethod === "cash" &&
+          isConfirmedPayment(payment) &&
           isSameDay(parseISO(payment.receivedAt), todayDate()),
       )
-      .reduce((sum, payment) => sum + payment.amount, 0),
+      .reduce((sum, payment) => roundMoney(sum + payment.amount), 0),
     pendingVerificationAmount: riderPayments
       .filter((payment) => payment.paymentStatus === "pending_verification")
-      .reduce((sum, payment) => sum + payment.amount, 0),
-    totalRecordedAmount: riderPayments.reduce((sum, payment) => sum + payment.amount, 0),
+      .reduce((sum, payment) => roundMoney(sum + payment.amount), 0),
+    totalRecordedAmount: riderPayments
+      .filter((payment) => payment.paymentStatus !== "rejected")
+      .reduce((sum, payment) => roundMoney(sum + payment.amount), 0),
   };
 }
 

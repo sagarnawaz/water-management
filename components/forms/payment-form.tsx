@@ -118,7 +118,7 @@ export function PaymentForm({
           </div>
           <div className="space-y-2">
             <Label htmlFor="amount">Amount</Label>
-            <Input id="amount" type="number" min="0" {...register("amount")} />
+            <Input id="amount" type="number" min="0" step="1" {...register("amount")} />
             {errors.amount ? <p className="text-sm text-destructive">{errors.amount.message}</p> : null}
           </div>
           <div className="space-y-2">

@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { roundMoney } from "@/lib/money";
+
 export const deliverySchema = z
   .object({
     deliveryRecordId: z.string().min(1),
@@ -17,7 +19,7 @@ export const deliverySchema = z
       "credit_due",
       "partial_payment",
     ]),
-    amountReceived: z.coerce.number().min(0).optional(),
+    amountReceived: z.coerce.number().min(0).transform(roundMoney).optional(),
     transactionReference: z.string().optional(),
     notes: z.string().optional(),
   })

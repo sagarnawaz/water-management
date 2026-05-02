@@ -8,6 +8,7 @@ import { StatusBadge } from "@/components/status-badge";
 import { buttonVariants } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { requireUser } from "@/lib/auth/session";
+import { isDeliveryCompleted } from "@/lib/delivery-status";
 import { formatCurrency, formatDateTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { getRiderDeliveries } from "@/services/data";
@@ -21,14 +22,14 @@ export default async function RiderDeliveriesPage() {
       <PageHeader
         eyebrow="Deliveries"
         title="Assigned delivery queue"
-        description="A complete list of your assigned stops with quick actions for calling, directions, and delivery completion."
+        description="Today&apos;s assigned stops plus any older deliveries still waiting for completion."
       />
 
       <div className="grid gap-4 md:grid-cols-3">
         <MetricCard
-          title="Assigned orders"
+          title="Visible stops"
           value={String(deliveries.totalCount)}
-          hint="All assigned stops"
+          hint="Today + pending older"
           icon={Route}
         />
         <MetricCard
@@ -53,7 +54,7 @@ export default async function RiderDeliveriesPage() {
           {deliveries.items.length === 0 ? (
             <EmptyState
               title="No deliveries assigned yet"
-              description="New rider assignments will show up here with the most urgent stops first."
+              description="Today&apos;s stops and pending older deliveries will show up here."
               action={
                 <Link
                   href="/rider"
@@ -67,8 +68,10 @@ export default async function RiderDeliveriesPage() {
               }
             />
           ) : (
-            deliveries.items.map(({ order, customer }) => {
+            deliveries.items.map(({ order, customer, deliveryRecord }) => {
               if (!customer) return null;
+
+              const isCompleted = isDeliveryCompleted(deliveryRecord.status);
 
               return (
                 <div
@@ -99,47 +102,54 @@ export default async function RiderDeliveriesPage() {
                   </div>
 
                   <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
-                    <a
-                      href={`tel:${customer.phone}`}
-                      className={cn(
-                        buttonVariants({ variant: "outline", size: "lg" }),
-                        "h-12 justify-center rounded-2xl",
-                      )}
-                    >
-                      <Phone className="size-4" />
-                      Call
-                    </a>
-                    <a
-                      href={order.locationUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                      className={cn(
-                        buttonVariants({ variant: "outline", size: "lg" }),
-                        "h-12 justify-center rounded-2xl",
-                      )}
-                    >
-                      <MapPinned className="size-4" />
-                      Map
-                    </a>
+                    {isCompleted ? null : (
+                      <>
+                        <a
+                          href={`tel:${customer.phone}`}
+                          className={cn(
+                            buttonVariants({ variant: "outline", size: "lg" }),
+                            "h-12 justify-center rounded-2xl",
+                          )}
+                        >
+                          <Phone className="size-4" />
+                          Call
+                        </a>
+                        <a
+                          href={order.locationUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className={cn(
+                            buttonVariants({ variant: "outline", size: "lg" }),
+                            "h-12 justify-center rounded-2xl",
+                          )}
+                        >
+                          <MapPinned className="size-4" />
+                          Map
+                        </a>
+                      </>
+                    )}
                     <Link
                       href={`/rider/deliveries/${order.id}`}
                       className={cn(
                         buttonVariants({ variant: "outline", size: "lg" }),
                         "h-12 justify-center rounded-2xl",
+                        isCompleted ? "sm:col-span-2 lg:col-span-4" : "",
                       )}
                     >
                       <ExternalLink className="size-4" />
-                      Detail
+                      View details
                     </Link>
-                    <Link
-                      href={`/rider/deliveries/${order.id}/complete`}
-                      className={cn(
-                        buttonVariants({ size: "lg" }),
-                        "h-12 justify-center rounded-2xl",
-                      )}
-                    >
-                      Mark delivered
-                    </Link>
+                    {isCompleted ? null : (
+                      <Link
+                        href={`/rider/deliveries/${order.id}/complete`}
+                        className={cn(
+                          buttonVariants({ size: "lg" }),
+                          "h-12 justify-center rounded-2xl",
+                        )}
+                      >
+                        Mark delivered
+                      </Link>
+                    )}
                   </div>
                 </div>
               );
